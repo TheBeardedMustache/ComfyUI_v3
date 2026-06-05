@@ -452,6 +452,12 @@ class CLIP:
         return self.patcher.get_key_patches()
 
     def generate(self, tokens, do_sample=True, max_length=256, temperature=1.0, top_k=50, top_p=0.95, min_p=0.0, repetition_penalty=1.0, seed=None, presence_penalty=0.0):
+        if not hasattr(self.cond_stage_model, 'generate'):
+            raise RuntimeError(
+                f"The loaded model ({type(self.cond_stage_model).__name__}) does not support text generation. "
+                "The TextGenerate node requires a language model (LLM) such as Qwen, LLaMA, or Gemma, "
+                "not a CLIP text encoder. Please load the correct model type."
+            )
         self.cond_stage_model.reset_clip_options()
 
         self.load_model(tokens)
