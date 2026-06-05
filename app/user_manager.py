@@ -380,8 +380,19 @@ class UserManager():
                 dir_name = os.path.dirname(path)
                 fd, tmp_path = tempfile.mkstemp(dir=dir_name)
                 try:
-                    with os.fdopen(fd, "wb") as f:
-                        f.write(body)
+                    # Pretty print JSON files for better source control
+                    if path.lower().endswith('.json'):
+                        try:
+                            json_data = json.loads(body.decode('utf-8'))
+                            formatted_json = json.dumps(json_data, indent=2)
+                            with os.fdopen(fd, "w", encoding='utf-8') as f:
+                                f.write(formatted_json)
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            with os.fdopen(fd, "wb") as f:
+                                f.write(body)
+                    else:
+                        with os.fdopen(fd, "wb") as f:
+                            f.write(body)
                     os.replace(tmp_path, path)
                 except:
                     os.unlink(tmp_path)
