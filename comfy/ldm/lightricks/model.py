@@ -915,7 +915,7 @@ class LTXBaseModel(torch.nn.Module, ABC):
         return attention_mask
 
     def forward(
-        self, x, timestep, context, attention_mask, frame_rate=25, transformer_options={}, keyframe_idxs=None, denoise_mask=None, **kwargs
+        self, x, timestep, context, attention_mask=None, frame_rate=25, transformer_options={}, keyframe_idxs=None, denoise_mask=None, **kwargs
     ):
         """
         Forward pass for LTX models.
@@ -924,7 +924,7 @@ class LTXBaseModel(torch.nn.Module, ABC):
             x: Input tensor
             timestep: Timestep tensor
             context: Context tensor (e.g., text embeddings)
-            attention_mask: Attention mask tensor
+            attention_mask: Attention mask tensor (optional)
             frame_rate: Frame rate for temporal processing
             transformer_options: Additional options for transformer blocks
             keyframe_idxs: Keyframe indices for temporal processing
@@ -942,7 +942,7 @@ class LTXBaseModel(torch.nn.Module, ABC):
         ).execute(x, timestep, context, attention_mask, frame_rate, transformer_options, keyframe_idxs, denoise_mask=denoise_mask, **kwargs)
 
     def _forward(
-        self, x, timestep, context, attention_mask, frame_rate=25, transformer_options={}, keyframe_idxs=None, denoise_mask=None, **kwargs
+        self, x, timestep, context, attention_mask=None, frame_rate=25, transformer_options={}, keyframe_idxs=None, denoise_mask=None, **kwargs
     ):
         """
         Internal forward pass for LTX models.
