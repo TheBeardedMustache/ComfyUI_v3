@@ -110,6 +110,10 @@ def apply_custom_paths():
         for config_path in itertools.chain(*args.extra_model_paths_config):
             utils.extra_config.load_extra_path_config(config_path)
 
+    # --base-directory
+    if args.base_directory:
+        logging.info(f"Setting base directory to: {folder_paths.base_path}")
+
     # --output-directory, --input-directory, --user-directory
     if args.output_directory:
         output_dir = os.path.abspath(args.output_directory)
