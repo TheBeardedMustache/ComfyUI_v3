@@ -7,6 +7,7 @@ const state = {
   busy: false,
   messages: [],
   lastWorkflow: null,
+  pendingDownloads: [],
 };
 
 function setting(name, fallback = "") {
@@ -96,12 +97,21 @@ async function sendCopilotMessage(prompt, execute = false) {
       } else if (event.type === "final") {
         state.lastWorkflow = event.workflow_api || null;
         const text = event.text || "Workflow edit is ready.";
+        const missingModels = event.missing_models || event.validation?.missing_models || [];
         appendMessage("assistant", text);
         if (event.workflow_api) {
           await applyWorkflowToCurrentGraph(event.workflow_api);
-          appendMessage("assistant", "Applied the validated edit to the current graph and laid it out without overlaps.");
+          appendMessage(
+            "assistant",
+            missingModels.length
+              ? "Applied the edit to the current graph and laid it out. It needs model downloads before it can validate and run."
+              : "Applied the validated edit to the current graph and laid it out without overlaps."
+          );
         }
-        if (event.validation && !event.validation.success) {
+        if (missingModels.length) {
+          state.pendingDownloads = missingModels;
+          appendDownloadApproval(missingModels, Boolean(body.execute));
+        } else if (event.validation && !event.validation.success) {
           appendMessage("assistant", `Validation still needs attention: ${JSON.stringify(event.validation)}`);
         }
       }
@@ -131,6 +141,31 @@ async function executeCurrentGraph() {
   });
   const result = await response.json();
   appendMessage("assistant", result.success ? `Queued workflow ${result.prompt_id}.` : `Could not execute: ${JSON.stringify(result)}`);
+}
+
+async function approveModelDownloads(downloads, executeAfterDownload = false) {
+  if (!downloads?.length) return;
+  setBusy(true);
+  try {
+    appendMessage("assistant", `Downloading ${downloads.length} approved model file(s)...`);
+    const response = await fetch("/api/copilot/download_models", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ approved: true, downloads }),
+    });
+    const result = await response.json();
+    if (!response.ok || !result.success) {
+      appendMessage("assistant", `One or more model downloads failed: ${JSON.stringify(result)}`);
+      return;
+    }
+    appendMessage("assistant", `Model downloads complete: ${result.results.map((item) => `${item.folder}/${item.filename}`).join(", ")}`);
+    await validateCurrentGraph();
+    if (executeAfterDownload) {
+      await executeCurrentGraph();
+    }
+  } finally {
+    setBusy(false);
+  }
 }
 
 async function applyWorkflowToCurrentGraph(workflowApi) {
@@ -214,6 +249,17 @@ function appendMessage(role, content) {
   renderMessages();
 }
 
+function appendDownloadApproval(downloads, executeAfterDownload) {
+  state.messages = state.messages.filter((message) => message.role !== "status");
+  state.messages.push({
+    role: "download_approval",
+    content: "This workflow needs model files that are not installed locally. Review the list and approve downloads if you want Copilot to fetch them into ComfyUI's model folders.",
+    downloads,
+    executeAfterDownload,
+  });
+  renderMessages();
+}
+
 function setBusy(busy) {
   state.busy = busy;
   const panel = document.getElementById("comfyui-copilot-panel");
@@ -232,10 +278,50 @@ function renderMessages() {
   for (const message of state.messages) {
     const item = document.createElement("div");
     item.className = `comfyui-copilot-message ${message.role}`;
-    item.textContent = message.content;
+    if (message.role === "download_approval") {
+      renderDownloadApprovalMessage(item, message);
+    } else {
+      item.textContent = message.content;
+    }
     list.appendChild(item);
   }
   list.scrollTop = list.scrollHeight;
+}
+
+function renderDownloadApprovalMessage(container, message) {
+  const intro = document.createElement("div");
+  intro.textContent = message.content;
+  container.appendChild(intro);
+
+  const list = document.createElement("ul");
+  for (const download of message.downloads || []) {
+    const row = document.createElement("li");
+    const url = download.url || "No URL provided";
+    row.textContent = `${download.folder}/${download.filename} - ${url}${download.reason ? ` (${download.reason})` : ""}`;
+    list.appendChild(row);
+  }
+  container.appendChild(list);
+
+  const actions = document.createElement("div");
+  actions.className = "comfyui-copilot-download-actions";
+
+  const approve = document.createElement("button");
+  approve.textContent = message.executeAfterDownload ? "Approve downloads + execute" : "Approve downloads";
+  approve.onclick = () => {
+    const missingUrls = (message.downloads || []).filter((download) => !download.url);
+    if (missingUrls.length) {
+      appendMessage("assistant", `Cannot download yet; ${missingUrls.length} model(s) have no source URL.`);
+      return;
+    }
+    approveModelDownloads(message.downloads, message.executeAfterDownload).catch((err) => appendMessage("assistant", err.message));
+  };
+  actions.appendChild(approve);
+
+  const cancel = document.createElement("button");
+  cancel.textContent = "Skip downloads";
+  cancel.onclick = () => appendMessage("assistant", "Skipped model downloads. The workflow remains on the graph, but it may not execute until the missing models are installed.");
+  actions.appendChild(cancel);
+  container.appendChild(actions);
 }
 
 function createPanel() {
@@ -378,6 +464,13 @@ function injectStyles() {
     .comfyui-copilot-message.user { align-self: flex-end; background: rgba(59,130,246,.32); }
     .comfyui-copilot-message.assistant { background: rgba(255,255,255,.08); }
     .comfyui-copilot-message.status { color: #fbbf24; background: rgba(251,191,36,.12); }
+    .comfyui-copilot-message.download_approval { background: rgba(251,191,36,.14); border: 1px solid rgba(251,191,36,.35); }
+    .comfyui-copilot-message.download_approval ul { margin: 8px 0; padding-left: 18px; word-break: break-word; }
+    .comfyui-copilot-download-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    .comfyui-copilot-download-actions button {
+      border: 1px solid rgba(255,255,255,.18); border-radius: 7px; padding: 6px 8px;
+      background: rgba(255,255,255,.10); color: inherit; cursor: pointer;
+    }
     #comfyui-copilot-input { height: 76px; resize: vertical; }
     #comfyui-copilot-panel[data-busy="true"] .comfyui-copilot-actions button { opacity: .55; }
   `;
