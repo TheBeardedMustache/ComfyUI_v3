@@ -4,8 +4,11 @@ import json
 import logging
 import os
 import re
+import socket
 import time
+import urllib.parse
 import uuid
+from contextlib import suppress
 from typing import Any
 
 import aiohttp
@@ -45,6 +48,7 @@ class CopilotManager:
                         "/api/copilot/chat",
                         "/api/copilot/validate",
                         "/api/copilot/execute",
+                        "/api/copilot/download_models",
                         "/api/copilot/node_catalog",
                         "/api/copilot/models",
                     ],
@@ -73,6 +77,7 @@ class CopilotManager:
             body = await _read_json(request)
             workflow_api = body.get("workflow_api") or body.get("prompt") or {}
             validation = await self._validate_workflow(workflow_api, strict_topology=True)
+            validation["missing_models"] = collect_missing_models(workflow_api, body)
             status_code = 200 if validation["success"] else 400
             return web.json_response(validation, status=status_code)
 
@@ -86,6 +91,36 @@ class CopilotManager:
                 return web.json_response(result)
             except ValueError as exc:
                 return web.json_response({"success": False, "error": str(exc)}, status=400)
+
+        @routes.post("/copilot/download_models")
+        async def download_models(request):
+            body = await _read_json(request)
+            if body.get("approved") is not True:
+                return web.json_response(
+                    {"success": False, "error": "Model downloads require explicit user approval."},
+                    status=403,
+                )
+
+            downloads = body.get("downloads")
+            if not isinstance(downloads, list):
+                return web.json_response({"success": False, "error": "downloads must be a list."}, status=400)
+
+            results = []
+            for item in downloads:
+                try:
+                    results.append(await self._download_model(item))
+                except Exception as exc:
+                    logging.exception("ComfyUI Copilot model download failed")
+                    results.append({"success": False, "error": str(exc), "request": _json_safe(item)})
+
+            with suppress(Exception):
+                self.prompt_server.model_file_manager.clear_cache()
+            with suppress(Exception):
+                from app.assets.scanner import seed_assets
+
+                seed_assets(("models",), enable_logging=False)
+
+            return web.json_response({"success": all(r.get("success") for r in results), "results": results})
 
         @routes.post("/copilot/chat")
         async def chat(request):
@@ -126,14 +161,24 @@ class CopilotManager:
 
                 max_attempts = _parse_int(body.get("max_repair_iterations"), 5)
                 validation = {"success": False, "error": "Workflow was not validated"}
+                missing_models: list[dict[str, Any]] = []
                 for attempt in range(1, max_attempts + 1):
                     workflow_api = candidate.get("workflow") or candidate.get("workflow_api")
                     if not isinstance(workflow_api, dict):
                         raise ValueError("LLM did not return a ComfyUI API-format workflow object.")
 
+                    missing_models = collect_missing_models(workflow_api, candidate)
                     validation = await self._validate_workflow(workflow_api, strict_topology=True)
+                    validation["missing_models"] = missing_models
                     if validation["success"]:
                         await emit("status", text=f"Workflow validation passed after {attempt} attempt(s).")
+                        break
+                    if missing_models:
+                        await emit(
+                            "status",
+                            text="Workflow needs missing models before validation can complete.",
+                            missing_models=missing_models,
+                        )
                         break
 
                     await emit(
@@ -155,7 +200,12 @@ class CopilotManager:
 
                 execute_after_apply = bool(body.get("execute"))
                 execution_result = None
-                if validation["success"] and execute_after_apply:
+                if missing_models:
+                    await emit(
+                        "status",
+                        text="The workflow references missing models. Waiting for your approval before downloading.",
+                    )
+                elif validation["success"] and execute_after_apply:
                     await emit("status", text="Queueing the validated workflow for execution.")
                     execution_result = await self._queue_prompt(final_workflow, client_id=body.get("client_id"))
 
@@ -164,6 +214,7 @@ class CopilotManager:
                     text=message,
                     workflow_api=final_workflow,
                     validation=validation,
+                    missing_models=missing_models,
                     execution=execution_result,
                     apply_to_current_graph=True,
                 )
@@ -280,6 +331,55 @@ class CopilotManager:
                         names.append(name)
         return sorted(set(names))
 
+    async def _download_model(self, item: Any) -> dict[str, Any]:
+        if not isinstance(item, dict):
+            raise ValueError("Each download item must be an object.")
+        folder = str(item.get("folder") or "").strip()
+        url = str(item.get("url") or item.get("download_url") or "").strip()
+        filename = _safe_model_filename(str(item.get("filename") or _filename_from_url(url) or "").strip())
+        if not folder or folder not in folder_paths.folder_names_and_paths:
+            raise ValueError(f"Unsupported model folder: {folder!r}")
+        if not url or not await _is_download_url_allowed(url):
+            raise ValueError(f"Refusing unsafe or unsupported download URL: {url!r}")
+        if not filename:
+            raise ValueError("A safe filename is required for model downloads.")
+
+        destination = _model_destination_path(folder, filename)
+        if os.path.exists(destination):
+            return {
+                "success": True,
+                "folder": folder,
+                "filename": filename,
+                "path": destination,
+                "already_present": True,
+            }
+
+        temp_path = f"{destination}.copilot-download-{uuid.uuid4().hex}.part"
+        os.makedirs(os.path.dirname(destination), exist_ok=True)
+        bytes_written = 0
+        try:
+            session = self.prompt_server.client_session
+            if session is not None:
+                bytes_written = await _download_url_to_file(session, url, temp_path)
+            else:
+                timeout = aiohttp.ClientTimeout(total=None)
+                async with aiohttp.ClientSession(timeout=timeout) as temp_session:
+                    bytes_written = await _download_url_to_file(temp_session, url, temp_path)
+            os.replace(temp_path, destination)
+        finally:
+            if os.path.exists(temp_path):
+                with suppress(Exception):
+                    os.remove(temp_path)
+
+        return {
+            "success": True,
+            "folder": folder,
+            "filename": filename,
+            "path": destination,
+            "bytes": bytes_written,
+            "already_present": False,
+        }
+
     async def _call_llm(
         self,
         settings: dict[str, str],
@@ -380,6 +480,16 @@ Return ONE JSON object only:
 {
   "assistant_message": "short explanation of the edit",
   "workflow": { "...": { "class_type": "...", "inputs": { ... } } },
+  "model_downloads": [
+    {
+      "folder": "checkpoints",
+      "filename": "exact_model_filename.safetensors",
+      "url": "https://direct-download-url",
+      "node_id": "node id that uses it",
+      "input_name": "input using it",
+      "reason": "why this model is needed"
+    }
+  ],
   "run_after_apply": false
 }
 
@@ -389,7 +499,8 @@ Workflow rules:
 - Satisfy every required input with either a literal value or a valid [node_id, output_index] link.
 - Preserve and modify the current workflow when one is provided. Generate from scratch only when the current graph is empty.
 - Do not leave orphan nodes: every non-output node should contribute to a PreviewImage, SaveImage, or another output node.
-- Prefer available local model filenames. If no model file is available, choose the closest installed default input value from node metadata.
+- Prefer available local model filenames. If a required model is not installed and the user request needs it, keep the intended filename in the workflow and add a model_downloads entry with a direct HTTPS download URL, target folder, and reason.
+- Only include model_downloads for models used by the returned workflow. Do not include API keys or signed private URLs.
 - Keep the graph focused, runnable, and minimal.
 - The frontend will apply the returned API workflow to the currently visible graph and lay it out, so do not include UI-only node positions.
 """
@@ -397,7 +508,7 @@ Workflow rules:
 
 COPILOT_REPAIR_PROMPT = """You repair invalid ComfyUI API workflows.
 
-Return ONE JSON object only with assistant_message and workflow. Use installed node metadata, fix every validation error, remove orphan nodes, preserve the user's requested behavior, and do not invent uninstalled class_type values.
+Return ONE JSON object only with assistant_message, workflow, and model_downloads if the workflow intentionally uses missing model files. Use installed node metadata, fix every validation error that is not resolved by downloading a declared model, remove orphan nodes, preserve the user's requested behavior, and do not invent uninstalled class_type values.
 """
 
 
@@ -471,6 +582,216 @@ def build_model_context() -> dict[str, list[str]]:
         if files:
             context[folder] = files[:40]
     return context
+
+
+MODEL_INPUT_FOLDER_HINTS = (
+    (("ckpt", "checkpoint"), "checkpoints"),
+    (("lora",), "loras"),
+    (("vae",), "vae"),
+    (("controlnet", "control_net"), "controlnet"),
+    (("upscale",), "upscale_models"),
+    (("unet", "diffusion_model", "diffusion"), "diffusion_models"),
+    (("clip",), "clip"),
+    (("text_encoder", "text_encoders"), "text_encoders"),
+    (("embedding",), "embeddings"),
+)
+
+
+def collect_missing_models(workflow_api: dict[str, Any], candidate: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Find model files referenced by a workflow that are not present locally."""
+    folder_files = build_model_context_full()
+    declared_downloads = _normalize_declared_downloads((candidate or {}).get("model_downloads"))
+    declared_by_key = {
+        (_normalize_folder(d.get("folder")), d.get("filename")): d
+        for d in declared_downloads
+        if d.get("folder") and d.get("filename")
+    }
+    missing: dict[tuple[str, str], dict[str, Any]] = {}
+
+    for node_id, node in (workflow_api or {}).items():
+        if not isinstance(node, dict):
+            continue
+        class_type = node.get("class_type")
+        if class_type not in nodes.NODE_CLASS_MAPPINGS:
+            continue
+        inputs = node.get("inputs") or {}
+        if not isinstance(inputs, dict):
+            continue
+        try:
+            input_specs = _node_info(class_type).get("input", {})
+        except Exception:
+            input_specs = {}
+
+        for input_name, value in inputs.items():
+            if not isinstance(value, str) or not value.strip() or _is_link(value):
+                continue
+            folder = _infer_model_folder(class_type, input_name, input_specs, folder_files)
+            if not folder:
+                continue
+            filename = _safe_model_filename(value)
+            if not filename or _model_file_exists(folder, filename, folder_files):
+                continue
+            key = (folder, filename)
+            declared = declared_by_key.get(key, {})
+            missing[key] = {
+                "folder": folder,
+                "filename": filename,
+                "url": declared.get("url") or declared.get("download_url") or "",
+                "node_id": str(node_id),
+                "class_type": class_type,
+                "input_name": input_name,
+                "reason": declared.get("reason") or f"{class_type}.{input_name} references a model file that is not installed.",
+            }
+
+    for declared in declared_downloads:
+        folder = _normalize_folder(declared.get("folder"))
+        filename = declared.get("filename")
+        if not folder or not filename:
+            continue
+        if _model_file_exists(folder, filename, folder_files):
+            continue
+        key = (folder, filename)
+        missing.setdefault(
+            key,
+            {
+                "folder": folder,
+                "filename": filename,
+                "url": declared.get("url") or declared.get("download_url") or "",
+                "node_id": str(declared.get("node_id") or ""),
+                "class_type": str(declared.get("class_type") or ""),
+                "input_name": str(declared.get("input_name") or ""),
+                "reason": str(declared.get("reason") or "Declared by Copilot for this workflow."),
+            },
+        )
+
+    return list(missing.values())
+
+
+def build_model_context_full() -> dict[str, list[str]]:
+    context: dict[str, list[str]] = {}
+    for folder in folder_paths.folder_names_and_paths:
+        if folder in {"configs", "custom_nodes"}:
+            continue
+        try:
+            context[folder] = folder_paths.get_filename_list(folder)
+        except Exception:
+            context[folder] = []
+    return context
+
+
+def _normalize_declared_downloads(downloads: Any) -> list[dict[str, Any]]:
+    if not isinstance(downloads, list):
+        return []
+    normalized = []
+    for item in downloads:
+        if not isinstance(item, dict):
+            continue
+        folder = _normalize_folder(item.get("folder"))
+        filename = _safe_model_filename(str(item.get("filename") or _filename_from_url(str(item.get("url") or "")) or ""))
+        if not folder or not filename:
+            continue
+        normalized.append(
+            {
+                **item,
+                "folder": folder,
+                "filename": filename,
+                "url": str(item.get("url") or item.get("download_url") or ""),
+            }
+        )
+    return normalized
+
+
+def _infer_model_folder(
+    class_type: str,
+    input_name: str,
+    input_specs: dict[str, Any],
+    folder_files: dict[str, list[str]],
+) -> str | None:
+    spec = _find_input_spec(input_name, input_specs)
+    choices = _input_choices(spec)
+    if choices:
+        for folder, files in folder_files.items():
+            overlap = set(choices) & set(files)
+            if overlap:
+                return folder
+
+    haystack = f"{class_type} {input_name}".lower()
+    for needles, folder in MODEL_INPUT_FOLDER_HINTS:
+        if folder in folder_paths.folder_names_and_paths and any(needle in haystack for needle in needles):
+            return folder
+    return None
+
+
+def _find_input_spec(input_name: str, input_specs: dict[str, Any]) -> Any:
+    if not isinstance(input_specs, dict):
+        return None
+    for group_name in ("required", "optional"):
+        group = input_specs.get(group_name)
+        if isinstance(group, dict) and input_name in group:
+            return group[input_name]
+    return None
+
+
+def _input_choices(spec: Any) -> list[str]:
+    if isinstance(spec, (list, tuple)) and spec:
+        first = spec[0]
+        if isinstance(first, (list, tuple)):
+            return [item for item in first if isinstance(item, str)]
+    return []
+
+
+def _model_file_exists(folder: str, filename: str, folder_files: dict[str, list[str]] | None = None) -> bool:
+    files = (folder_files or build_model_context_full()).get(folder, [])
+    normalized = filename.replace("\\", "/")
+    return normalized in files or os.path.basename(normalized) in {os.path.basename(f) for f in files}
+
+
+def _normalize_folder(folder: Any) -> str:
+    folder_name = str(folder or "").strip()
+    if folder_name in folder_paths.folder_names_and_paths:
+        return folder_name
+    aliases = {
+        "checkpoint": "checkpoints",
+        "ckpt": "checkpoints",
+        "lora": "loras",
+        "controlnets": "controlnet",
+        "upscale": "upscale_models",
+        "upscaler": "upscale_models",
+        "embeddings": "embeddings",
+    }
+    return aliases.get(folder_name.lower(), "")
+
+
+def _safe_model_filename(filename: str) -> str:
+    filename = urllib.parse.unquote((filename or "").replace("\\", "/")).strip()
+    if not filename or filename.startswith("/") or ".." in filename.split("/"):
+        return ""
+    safe_parts = []
+    for part in filename.split("/"):
+        clean = re.sub(r"[^a-zA-Z0-9._() \-+]", "_", part).strip()
+        if not clean:
+            return ""
+        safe_parts.append(clean)
+    return "/".join(safe_parts)
+
+
+def _filename_from_url(url: str) -> str:
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return ""
+    return os.path.basename(urllib.parse.unquote(parsed.path))
+
+
+def _model_destination_path(folder: str, filename: str) -> str:
+    roots = folder_paths.get_folder_paths(folder)
+    if not roots:
+        raise ValueError(f"No filesystem path is configured for model folder {folder!r}.")
+    root = os.path.abspath(roots[0])
+    destination = os.path.abspath(os.path.join(root, filename))
+    if os.path.commonpath((root, destination)) != root:
+        raise ValueError("Model filename escapes the target folder.")
+    return destination
 
 
 def build_node_catalog(query: str = "", limit: int | None = 200) -> list[dict[str, Any]]:
@@ -693,6 +1014,58 @@ async def _request_json(session: aiohttp.ClientSession, method: str, url: str, *
             return json.loads(text)
         except json.JSONDecodeError as exc:
             raise ValueError(f"LLM returned non-JSON response: {text[:1000]}") from exc
+
+
+async def _download_url_to_file(session: aiohttp.ClientSession, url: str, destination: str) -> int:
+    async with session.get(url) as response:
+        final_url = str(response.url)
+        if not await _is_download_url_allowed(final_url):
+            raise ValueError(f"Refusing redirect to unsafe URL: {final_url!r}")
+        if response.status >= 400:
+            text = await response.text()
+            raise ValueError(f"Model download failed with HTTP {response.status}: {text[:1000]}")
+
+        bytes_written = 0
+        with open(destination, "wb") as file:
+            async for chunk in response.content.iter_chunked(1024 * 1024):
+                if not chunk:
+                    continue
+                file.write(chunk)
+                bytes_written += len(chunk)
+        if bytes_written <= 0:
+            raise ValueError("Downloaded model was empty.")
+        return bytes_written
+
+
+async def _is_download_url_allowed(url: str) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return False
+    host = parsed.hostname.strip().lower()
+    if host in {"localhost", "0.0.0.0"} or host.endswith(".localhost"):
+        return False
+    try:
+        ip = _ip_address(host)
+        if ip is not None:
+            return not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast)
+        for result in socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP):
+            resolved = _ip_address(result[4][0])
+            if resolved is None:
+                return False
+            if resolved.is_private or resolved.is_loopback or resolved.is_link_local or resolved.is_multicast:
+                return False
+    except OSError:
+        return False
+    return True
+
+
+def _ip_address(host: str):
+    try:
+        import ipaddress
+
+        return ipaddress.ip_address(host)
+    except ValueError:
+        return None
 
 
 def _join_url(base_url: str, path: str) -> str:
