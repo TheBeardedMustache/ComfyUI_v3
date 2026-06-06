@@ -1,6 +1,35 @@
+import sys
+import types
+
 from aiohttp.test_utils import make_mocked_request
 
-import nodes
+
+nodes = types.ModuleType("nodes")
+nodes.NODE_CLASS_MAPPINGS = {}
+nodes.NODE_DISPLAY_NAME_MAPPINGS = {}
+nodes.EXTENSION_WEB_DIRS = {}
+sys.modules["nodes"] = nodes
+
+execution = types.ModuleType("execution")
+
+
+async def validate_prompt(_prompt_id, _workflow_api, _partial_execution_targets):
+    return True, None, [], {}
+
+
+execution.validate_prompt = validate_prompt
+sys.modules["execution"] = execution
+
+folder_paths = types.ModuleType("folder_paths")
+folder_paths.get_filename_list = lambda _folder: []
+sys.modules["folder_paths"] = folder_paths
+
+comfy_api = types.ModuleType("comfy_api")
+comfy_api_internal = types.ModuleType("comfy_api.internal")
+comfy_api_internal._ComfyNodeInternal = type("_ComfyNodeInternal", (), {})
+sys.modules["comfy_api"] = comfy_api
+sys.modules["comfy_api.internal"] = comfy_api_internal
+
 from app import copilot_manager
 
 
