@@ -144,6 +144,8 @@ def test_collect_missing_models_merges_declared_download(monkeypatch):
         "get_filename_list",
         lambda folder: ["installed.safetensors"] if folder == "checkpoints" else [],
     )
+    copilot_manager.folder_paths = folder_paths
+    copilot_manager.nodes = nodes
 
     missing = copilot_manager.collect_missing_models(
         {

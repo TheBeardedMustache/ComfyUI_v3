@@ -134,21 +134,12 @@ async def test_copilot_agent_finishes_after_repeated_tool_calls():
                         "message": {
                             "content": json.dumps(
                                 {
-                                    "assistant_message": "WAN image-to-video workflow",
+                                    "assistant_message": "partial",
                                     "workflow": {
                                         "1": {"class_type": "LoadImage", "inputs": {"image": "input.png"}},
                                         "2": {
                                             "class_type": "WanImageToVideo",
-                                            "inputs": {
-                                                "positive": ["3", 0],
-                                                "negative": ["4", 0],
-                                                "vae": ["5", 0],
-                                                "width": 832,
-                                                "height": 480,
-                                                "length": 81,
-                                                "batch_size": 1,
-                                                "start_image": ["1", 0],
-                                            },
+                                            "inputs": {"width": 832, "height": 480, "length": 81, "batch_size": 1},
                                         },
                                     },
                                     "workflow_complete": False,
@@ -165,6 +156,22 @@ async def test_copilot_agent_finishes_after_repeated_tool_calls():
     manager = CopilotManager(prompt_server=None)
     manager.add_routes(routes)
     app.add_routes(routes)
+
+    # Minimal node registry so recipe completion can detect output nodes.
+    import nodes as nodes_mod
+
+    class SaveVideoNode:
+        OUTPUT_NODE = True
+
+    nodes_mod.NODE_CLASS_MAPPINGS.update(
+        {
+            "LoadImage": object(),
+            "WanImageToVideo": object(),
+            "SaveVideo": SaveVideoNode,
+            "SaveImage": type("SaveImageNode", (), {"OUTPUT_NODE": True}),
+        }
+    )
+    copilot_manager_module.nodes = nodes_mod
 
     async with TestClient(TestServer(app)) as client:
         with patch.object(CopilotManager, "_http_json", fake_http_json):
@@ -187,6 +194,8 @@ async def test_copilot_agent_finishes_after_repeated_tool_calls():
             assert "too many tool rounds" not in body
             assert tool_calls["count"] >= 1
             assert captured.get("final_payload") is not None
+            assert '"SaveVideo"' in body or '"CreateVideo"' in body
+            assert body.count('"class_type"') >= 8
 
 
 @pytest.mark.asyncio

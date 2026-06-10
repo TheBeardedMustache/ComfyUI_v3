@@ -23,7 +23,7 @@ from comfy_api.internal import _ComfyNodeInternal
 
 COPILOT_EXTENSION_NAME = "comfyui-copilot"
 # Bump when Copilot context/MCP behavior changes (visible in /api/copilot/status).
-COPILOT_VERSION = "mcp-tools-v3"
+COPILOT_VERSION = "mcp-tools-v4"
 
 
 class CopilotManager:
@@ -222,6 +222,11 @@ class CopilotManager:
                     current_ui_workflow=current_ui_workflow,
                     execution_errors=body.get("execution_errors") or [],
                 )
+                from app.copilot_recipes import enrich_candidate_with_recipe
+
+                candidate = enrich_candidate_with_recipe(
+                    candidate, prompt=prompt, current_workflow=current_workflow
+                )
 
                 max_attempts = _parse_int(body.get("max_repair_iterations"), 5)
                 validation = {"success": False, "error": "Workflow was not validated"}
@@ -254,15 +259,19 @@ class CopilotManager:
                     )
                     if attempt == max_attempts:
                         break
+                    repair_base = merge_workflow_into_current(current_workflow, candidate)
                     candidate = await self._repair_workflow_edit(
                         settings=settings,
                         prompt=prompt,
                         history=history,
-                        current_workflow=current_workflow,
+                        current_workflow=repair_base,
                         current_ui_workflow=current_ui_workflow,
                         candidate=candidate,
                         validation=validation,
                         execution_errors=body.get("execution_errors") or [],
+                    )
+                    candidate = enrich_candidate_with_recipe(
+                        candidate, prompt=prompt, current_workflow=repair_base
                     )
 
                 final_workflow = merge_workflow_into_current(
@@ -765,9 +774,9 @@ You have MCP tools — use them sparingly, then return workflow JSON:
 
 Tool budget: use at most 3 tool calls total, then you MUST return the workflow JSON object.
 Do NOT call validate_workflow — the server validates automatically after you respond.
-node_hints in the user message already includes schemas for common/core nodes and nodes in the current graph.
-After 1× search_nodes (optional) and get_node_info for any unfamiliar class_type, return the workflow JSON immediately.
-Do not loop on tools. Prefer a partial workflow over endless tool calls.
+node_hints and workflow_recipe (when present) include schemas and a full end-to-end scaffold.
+When workflow_recipe is present you MUST return the COMPLETE graph: every node in required_class_types, fully wired to an output node (SaveImage / SaveVideo / PreviewImage).
+Never return a stub with only 1-2 nodes when building a new workflow — include the full pipeline from loaders through sampling to output.
 
 Workflow rules:
 - Use ComfyUI API/execution format keyed by string node ids.
@@ -775,7 +784,8 @@ Workflow rules:
 - Every required input must be a literal value or a valid link [source_node_id, output_slot_index] (0-based).
 - Match link types using get_node_info output_slots and input types.
 - When editing an existing graph, preserve unrelated nodes: include them in workflow or list removed_node_ids explicitly.
-- Return the nodes you changed plus any nodes they connect to; the server merges into the current graph.
+- When building a new workflow from workflow_recipe, start from the scaffold node ids/links and adjust prompts, models, and sizes as needed.
+- Return the full workflow object for new graphs (typically 7-12 nodes), not a tiny fragment.
 - Every non-output node must feed an output node (SaveImage, PreviewImage, etc.). No orphan nodes.
 - Prefer installed model filenames from list_model_files. For missing models, keep filenames and add model_downloads with direct HTTPS URLs.
 - Respect hardware_context: lower resolution/batch/steps on low VRAM or CPU-only systems.
@@ -813,6 +823,9 @@ ESSENTIAL_NODE_TYPES = frozenset(
         "ControlNetLoader",
         "ControlNetApply",
         "ControlNetApplyAdvanced",
+        "WanImageToVideo",
+        "CreateVideo",
+        "SaveVideo",
     }
 )
 
@@ -844,8 +857,16 @@ def build_copilot_messages(
     slim_repair = _slim_repair_context(repair_context) if repair_context else None
     hardware = build_hardware_context()
     node_hints = build_inline_node_hints(current_workflow, prompt=prompt)
-    context = trim_context_for_llm(
-        {
+    from app.copilot_recipes import (
+        build_recipe_workflow,
+        detect_workflow_recipe,
+        is_create_workflow_intent,
+        recipe_node_count,
+        recipe_required_class_types,
+    )
+
+    recipe_id = detect_workflow_recipe(prompt)
+    context_payload: dict[str, Any] = {
             "user_request": prompt,
             "current_workflow_api": compact_workflow_api(current_workflow),
             "current_workflow_ui": summarize_ui_workflow(current_ui_workflow),
@@ -858,9 +879,16 @@ def build_copilot_messages(
             },
             "execution_errors": _slim_execution_errors(execution_errors or [])[:4],
             "repair_context": slim_repair,
-            "note": "node_hints covers common nodes and the current graph. Use MCP tools only for unfamiliar class_types.",
+            "note": "Use workflow_recipe scaffold for new graphs. Use MCP tools only for unfamiliar class_types.",
         }
-    )
+    if recipe_id and (not current_workflow or is_create_workflow_intent(prompt)):
+        context_payload["workflow_recipe"] = {
+            "id": recipe_id,
+            "required_node_count": recipe_node_count(recipe_id),
+            "required_class_types": sorted(recipe_required_class_types(recipe_id)),
+            "scaffold": compact_workflow_api(build_recipe_workflow(recipe_id)),
+        }
+    context = trim_context_for_llm(context_payload)
     user_content = json.dumps(context, ensure_ascii=False)
     if repair_context:
         user_content = (
