@@ -547,6 +547,37 @@ Workflow rules:
 """
 
 
+# Common nodes included in every Copilot context (keeps simple requests small but useful).
+ESSENTIAL_NODE_TYPES = frozenset(
+    {
+        "CheckpointLoaderSimple",
+        "CheckpointLoader",
+        "KSampler",
+        "KSamplerAdvanced",
+        "EmptyLatentImage",
+        "VAEDecode",
+        "VAEEncode",
+        "VAELoader",
+        "SaveImage",
+        "PreviewImage",
+        "CLIPTextEncode",
+        "CLIPLoader",
+        "LoraLoader",
+        "LoraLoaderModelOnly",
+        "UNETLoader",
+        "DualCLIPLoader",
+        "LoadImage",
+        "ImageScale",
+        "ControlNetLoader",
+        "ControlNetApply",
+        "ControlNetApplyAdvanced",
+    }
+)
+
+# Rough character budget for the JSON user payload (~30-40k tokens with headroom under 128k total).
+COPILOT_CONTEXT_CHAR_BUDGET = 100_000
+
+
 def build_copilot_messages(
     *,
     prompt: str,
@@ -557,33 +588,35 @@ def build_copilot_messages(
     repair_context: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
     compact_history = []
-    for message in history[-10:]:
+    for message in history[-6:]:
         role = message.get("role", "user")
         if role in {"ai", "assistant"}:
             role = "assistant"
         elif role != "user":
             continue
-        compact_history.append({"role": role, "content": str(message.get("content", ""))[:2500]})
+        compact_history.append({"role": role, "content": str(message.get("content", ""))[:900]})
 
-    relevant_nodes = build_node_catalog(query=prompt, limit=1200)
-    if repair_context:
-        workflow = (repair_context.get("candidate") or {}).get("workflow") or {}
-        for node in workflow.values():
-            if isinstance(node, dict) and node.get("class_type"):
-                relevant_nodes = _merge_catalog_entries(
-                    relevant_nodes, build_node_catalog(query=node["class_type"], limit=40)
-                )
+    catalog_limit = 140 if repair_context else 100
+    relevant_nodes = build_relevant_node_catalog(
+        query=prompt,
+        workflow_api=current_workflow,
+        repair_context=repair_context,
+        limit=catalog_limit,
+    )
 
-    context = {
-        "user_request": prompt,
-        "current_workflow_api": current_workflow,
-        "current_workflow_ui": summarize_ui_workflow(current_ui_workflow),
-        "installed_nodes": relevant_nodes,
-        "available_models": build_model_context(),
-        "hardware_context": build_hardware_context(),
-        "execution_errors": (execution_errors or [])[:6],
-        "repair_context": repair_context,
-    }
+    slim_repair = _slim_repair_context(repair_context) if repair_context else None
+    context = trim_context_for_llm(
+        {
+            "user_request": prompt,
+            "current_workflow_api": compact_workflow_api(current_workflow),
+            "current_workflow_ui": summarize_ui_workflow(current_ui_workflow),
+            "installed_nodes": relevant_nodes,
+            "available_models": build_model_context(limit_per_folder=10),
+            "hardware_context": build_hardware_context(),
+            "execution_errors": _slim_execution_errors(execution_errors or [])[:4],
+            "repair_context": slim_repair,
+        }
+    )
     user_content = json.dumps(context, ensure_ascii=False)
     if repair_context:
         user_content = (
@@ -596,6 +629,177 @@ def build_copilot_messages(
         *compact_history,
         {"role": "user", "content": user_content},
     ]
+
+
+def build_relevant_node_catalog(
+    *,
+    query: str,
+    workflow_api: dict[str, Any],
+    repair_context: dict[str, Any] | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    pinned: set[str] = set(ESSENTIAL_NODE_TYPES)
+    for node in (workflow_api or {}).values():
+        if isinstance(node, dict) and node.get("class_type"):
+            pinned.add(str(node["class_type"]))
+
+    if repair_context:
+        candidate = repair_context.get("candidate") or {}
+        workflow = candidate.get("workflow") or candidate.get("workflow_api") or {}
+        for node in workflow.values():
+            if isinstance(node, dict) and node.get("class_type"):
+                pinned.add(str(node["class_type"]))
+        for hint in repair_context.get("connection_hints") or []:
+            if isinstance(hint, dict) and hint.get("class_type"):
+                pinned.add(str(hint["class_type"]))
+
+    terms = [term.lower() for term in re.findall(r"[a-zA-Z0-9_./-]+", query or "") if len(term) > 2]
+    scored: list[tuple[int, str, dict[str, Any]]] = []
+    for class_type in nodes.NODE_CLASS_MAPPINGS:
+        try:
+            info = _node_info(class_type)
+        except Exception:
+            continue
+        entry = _minimal_catalog_entry(class_type, info)
+        score = _score_catalog_entry(entry, terms)
+        if class_type in pinned:
+            score += 1000
+        scored.append((score, class_type, entry))
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [entry for _, _, entry in scored[:limit]]
+
+
+def _minimal_catalog_entry(class_type: str, info: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "class_type": class_type,
+        "display_name": info.get("display_name") or class_type,
+        "category": str(info.get("category", ""))[:80],
+        "inputs": _minimal_inputs(info.get("input", {})),
+        "output_slots": _build_output_slots(info),
+        "output_node": bool(info.get("output_node", False)),
+    }
+
+
+def _minimal_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    for group_name in ("required", "optional"):
+        group = inputs.get(group_name) if isinstance(inputs, dict) else {}
+        if not isinstance(group, dict):
+            continue
+        compact[group_name] = {}
+        for name, spec in group.items():
+            compact[group_name][name] = _minimal_input_spec(spec)
+    return compact
+
+
+def _minimal_input_spec(spec: Any) -> Any:
+    if isinstance(spec, (list, tuple)) and spec:
+        first = spec[0]
+        if isinstance(first, (list, tuple)):
+            if len(first) <= 8:
+                return {"type": "COMBO", "choices": list(first)}
+            return {"type": "COMBO", "sample": list(first[:5]), "choice_count": len(first)}
+        if isinstance(first, str):
+            return first
+        return str(first)
+    return _json_safe(spec)
+
+
+def compact_workflow_api(workflow_api: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(workflow_api, dict) or not workflow_api:
+        return {}
+    compact: dict[str, Any] = {}
+    for node_id, node in workflow_api.items():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs") or {}
+        compact_inputs: dict[str, Any] = {}
+        if isinstance(inputs, dict):
+            for key, value in inputs.items():
+                if isinstance(value, str) and len(value) > 160:
+                    compact_inputs[key] = value[:160] + "..."
+                else:
+                    compact_inputs[key] = value
+        compact[str(node_id)] = {
+            "class_type": node.get("class_type"),
+            "inputs": compact_inputs,
+        }
+    return compact
+
+
+def _slim_execution_errors(errors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    slim = []
+    for error in errors:
+        if not isinstance(error, dict):
+            continue
+        slim.append(
+            {
+                "node_id": error.get("node_id"),
+                "node_type": error.get("node_type"),
+                "exception_message": str(error.get("exception_message") or error.get("message") or "")[:500],
+                "exception_type": error.get("exception_type"),
+            }
+        )
+    return slim
+
+
+def _slim_repair_context(repair_context: dict[str, Any]) -> dict[str, Any]:
+    candidate = repair_context.get("candidate") or {}
+    workflow = candidate.get("workflow") or candidate.get("workflow_api") or {}
+    return {
+        "candidate": {
+            "assistant_message": candidate.get("assistant_message"),
+            "workflow": compact_workflow_api(workflow),
+            "removed_node_ids": candidate.get("removed_node_ids") or [],
+            "model_downloads": (candidate.get("model_downloads") or [])[:8],
+        },
+        "validation": repair_context.get("validation"),
+        "connection_hints": (repair_context.get("connection_hints") or [])[:40],
+    }
+
+
+def trim_context_for_llm(context: dict[str, Any], char_budget: int = COPILOT_CONTEXT_CHAR_BUDGET) -> dict[str, Any]:
+    trimmed = _json_safe(context)
+    payload = json.dumps(trimmed, ensure_ascii=False)
+    if len(payload) <= char_budget:
+        return trimmed
+
+    reduced = dict(trimmed)
+    for node_limit in (80, 60, 45, 30):
+        nodes_list = reduced.get("installed_nodes")
+        if isinstance(nodes_list, list) and len(nodes_list) > node_limit:
+            reduced["installed_nodes"] = nodes_list[:node_limit]
+        payload = json.dumps(reduced, ensure_ascii=False)
+        if len(payload) <= char_budget:
+            return reduced
+
+    for folder_limit in (8, 5, 3):
+        models = reduced.get("available_models")
+        if isinstance(models, dict):
+            reduced["available_models"] = {
+                folder: files[:folder_limit] for folder, files in models.items() if isinstance(files, list)
+            }
+        payload = json.dumps(reduced, ensure_ascii=False)
+        if len(payload) <= char_budget:
+            return reduced
+
+    ui = reduced.get("current_workflow_ui")
+    if isinstance(ui, dict):
+        reduced["current_workflow_ui"] = {
+            "node_count": ui.get("node_count"),
+            "nodes": (ui.get("nodes") or [])[:40],
+            "links": (ui.get("links") or [])[:60],
+        }
+    payload = json.dumps(reduced, ensure_ascii=False)
+    if len(payload) <= char_budget:
+        return reduced
+
+    workflow = reduced.get("current_workflow_api")
+    if isinstance(workflow, dict) and len(workflow) > 40:
+        keep_ids = list(workflow.keys())[:40]
+        reduced["current_workflow_api"] = {node_id: workflow[node_id] for node_id in keep_ids}
+    return reduced
 
 
 def summarize_ui_workflow(workflow_ui: dict[str, Any]) -> dict[str, Any]:
@@ -611,22 +815,20 @@ def summarize_ui_workflow(workflow_ui: dict[str, Any]) -> dict[str, Any]:
                 "id": node.get("id"),
                 "type": node.get("type"),
                 "title": node.get("title"),
-                "pos": node.get("pos"),
                 "widgets": _summarize_ui_widgets(node.get("widgets")),
             }
-            for node in nodes_ui[:250]
+            for node in nodes_ui[:80]
             if isinstance(node, dict)
         ]
     if isinstance(links_ui, list):
         summary["links"] = [
             {
-                "id": link[0] if isinstance(link, list) and link else None,
                 "origin_id": link[1] if isinstance(link, list) and len(link) > 1 else None,
                 "origin_slot": link[2] if isinstance(link, list) and len(link) > 2 else None,
                 "target_id": link[3] if isinstance(link, list) and len(link) > 3 else None,
                 "target_slot": link[4] if isinstance(link, list) and len(link) > 4 else None,
             }
-            for link in links_ui[:400]
+            for link in links_ui[:120]
             if isinstance(link, list)
         ]
     return summary
@@ -748,8 +950,8 @@ def build_connection_hints_for_workflow(workflow_api: dict[str, Any]) -> list[di
             {
                 "node_id": str(node_id),
                 "class_type": class_type,
-                "inputs": _compact_inputs(info.get("input", {})),
-                "outputs": _build_output_slots(info),
+                "inputs": _minimal_inputs(info.get("input", {})),
+                "output_slots": _build_output_slots(info),
             }
         )
     return hints[:80]
@@ -840,7 +1042,7 @@ def _build_output_slots(info: dict[str, Any]) -> list[dict[str, Any]]:
     return slots
 
 
-def build_model_context() -> dict[str, list[str]]:
+def build_model_context(*, limit_per_folder: int = 10) -> dict[str, list[str]]:
     folders = [
         "checkpoints",
         "loras",
@@ -860,7 +1062,7 @@ def build_model_context() -> dict[str, list[str]]:
         except Exception:
             files = []
         if files:
-            context[folder] = files[:40]
+            context[folder] = files[:limit_per_folder]
     return context
 
 

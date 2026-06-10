@@ -365,7 +365,12 @@ function buildPanelMarkup() {
           </select>
         </label>
         <label>Base URL <input id="comfyui-copilot-base-url" autocomplete="off" /></label>
-        <label>Model <input id="comfyui-copilot-model" autocomplete="off" /></label>
+        <label>Model
+          <div class="comfyui-copilot-model-row">
+            <select id="comfyui-copilot-model"></select>
+            <button type="button" id="comfyui-copilot-refresh-models" data-always-enabled="true" title="Refresh model list">↻</button>
+          </div>
+        </label>
         <label>API key <input id="comfyui-copilot-api-key" type="password" autocomplete="off" placeholder="Stored locally in this browser" /></label>
       </section>
       <div id="comfyui-copilot-messages" class="comfyui-copilot-messages"></div>
@@ -377,6 +382,62 @@ function buildPanelMarkup() {
   `;
 }
 
+function defaultModelForProvider(providerName) {
+  return providerName === "anthropic" ? "claude-3-5-sonnet-latest" : "gpt-4o-mini";
+}
+
+function ensureModelOption(select, modelName) {
+  if (!modelName || [...select.options].some((opt) => opt.value === modelName)) return;
+  const opt = document.createElement("option");
+  opt.value = modelName;
+  opt.textContent = modelName;
+  select.appendChild(opt);
+}
+
+async function loadModelDropdown(options = {}) {
+  const select = state.panelRoot?.querySelector("#comfyui-copilot-model");
+  if (!select) return;
+  const provider = state.panelRoot.querySelector("#comfyui-copilot-provider")?.value || "openai";
+  const saved = setting("model", defaultModelForProvider(provider));
+  const refreshBtn = state.panelRoot.querySelector("#comfyui-copilot-refresh-models");
+  if (refreshBtn) refreshBtn.disabled = true;
+
+  try {
+    const response = await fetch("/api/copilot/models", { headers: headersFromSettings() });
+    const data = await response.json();
+    const models = data.models || [];
+    select.replaceChildren();
+    if (!models.length) {
+      ensureModelOption(select, saved || defaultModelForProvider(provider));
+    } else {
+      for (const entry of models) {
+        const name = entry.name || entry.label;
+        if (!name) continue;
+        const opt = document.createElement("option");
+        opt.value = name;
+        opt.textContent = entry.label || name;
+        select.appendChild(opt);
+      }
+      ensureModelOption(select, saved);
+    }
+    select.value = [...select.options].some((opt) => opt.value === saved)
+      ? saved
+      : (select.options[0]?.value || saved);
+    setSetting("model", select.value);
+    if (options.showStatus && data.error) {
+      appendMessage("assistant", `Could not refresh models: ${data.error}`);
+    }
+  } catch (err) {
+    ensureModelOption(select, saved || defaultModelForProvider(provider));
+    select.value = saved || defaultModelForProvider(provider);
+    if (options.showStatus) {
+      appendMessage("assistant", `Could not load models: ${err.message}`);
+    }
+  } finally {
+    if (refreshBtn) refreshBtn.disabled = false;
+  }
+}
+
 function wirePanel(root) {
   state.panelRoot = root;
   const provider = root.querySelector("#comfyui-copilot-provider");
@@ -385,11 +446,13 @@ function wirePanel(root) {
   const apiKey = root.querySelector("#comfyui-copilot-api-key");
   const settings = root.querySelector(".comfyui-copilot-settings");
   const settingsToggle = root.querySelector(".comfyui-copilot-settings-toggle");
+  const refreshModels = root.querySelector("#comfyui-copilot-refresh-models");
 
   provider.value = setting("provider", "openai");
   baseUrl.value = setting("baseUrl", provider.value === "anthropic" ? "https://api.anthropic.com/v1" : "https://api.openai.com/v1");
-  model.value = setting("model", provider.value === "anthropic" ? "claude-3-5-sonnet-latest" : "gpt-4o-mini");
   apiKey.value = setting("apiKey");
+  ensureModelOption(model, setting("model", defaultModelForProvider(provider.value)));
+  model.value = setting("model", defaultModelForProvider(provider.value));
 
   const persistSettings = () => {
     setSetting("provider", provider.value);
@@ -398,16 +461,23 @@ function wirePanel(root) {
     setSetting("apiKey", apiKey.value);
   };
 
-  provider.onchange = () => {
+  provider.onchange = async () => {
     if (!baseUrl.value || baseUrl.value.includes("api.openai.com") || baseUrl.value.includes("api.anthropic.com")) {
       baseUrl.value = provider.value === "anthropic" ? "https://api.anthropic.com/v1" : "https://api.openai.com/v1";
     }
+    const nextDefault = defaultModelForProvider(provider.value);
+    ensureModelOption(model, nextDefault);
     if (!model.value || model.value === "gpt-4o-mini" || model.value === "claude-3-5-sonnet-latest") {
-      model.value = provider.value === "anthropic" ? "claude-3-5-sonnet-latest" : "gpt-4o-mini";
+      model.value = nextDefault;
     }
     persistSettings();
+    await loadModelDropdown();
   };
-  [baseUrl, model, apiKey].forEach((el) => el.addEventListener("change", persistSettings));
+  baseUrl.addEventListener("change", persistSettings);
+  apiKey.addEventListener("change", persistSettings);
+  model.addEventListener("change", persistSettings);
+  refreshModels.onclick = () => loadModelDropdown({ showStatus: true });
+  loadModelDropdown();
 
   settingsToggle.onclick = () => settings.classList.toggle("collapsed");
 
@@ -543,6 +613,23 @@ function injectStyles() {
       gap: 4px;
       font-size: 11px;
       opacity: 0.85;
+    }
+    .comfyui-copilot-model-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 6px;
+      align-items: center;
+    }
+    #comfyui-copilot-refresh-models {
+      border: 1px solid rgba(255,255,255,.14);
+      background: rgba(255,255,255,.08);
+      color: inherit;
+      border-radius: 8px;
+      width: 34px;
+      height: 34px;
+      cursor: pointer;
+      font-size: 16px;
+      line-height: 1;
     }
     .comfyui-copilot-settings input,
     .comfyui-copilot-settings select,

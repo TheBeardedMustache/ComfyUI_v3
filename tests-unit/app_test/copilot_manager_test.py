@@ -212,6 +212,55 @@ def test_merge_workflow_into_current_honors_removed_node_ids():
     assert "2" in merged
 
 
+def test_build_copilot_messages_stays_within_context_budget(monkeypatch):
+    monkeypatch.setattr(
+        nodes,
+        "NODE_CLASS_MAPPINGS",
+        {
+            "DummyLoader": DummyLoader,
+            "DummyPreview": DummyPreview,
+            "DummyCheckpointLoader": DummyCheckpointLoader,
+        },
+    )
+    monkeypatch.setattr(nodes, "NODE_DISPLAY_NAME_MAPPINGS", {})
+    monkeypatch.setattr(copilot_manager, "build_hardware_context", lambda: {"cpu_only": True})
+    monkeypatch.setattr(copilot_manager, "build_model_context", lambda **_: {"checkpoints": ["installed.safetensors"]})
+
+    messages = copilot_manager.build_copilot_messages(
+        prompt="build a simple image preview workflow",
+        history=[{"role": "user", "content": "hello"}],
+        current_workflow={},
+        current_ui_workflow={},
+    )
+
+    user_message = next(message for message in messages if message["role"] == "user")
+    assert len(user_message["content"]) < copilot_manager.COPILOT_CONTEXT_CHAR_BUDGET
+
+
+def test_build_relevant_node_catalog_prioritizes_workflow_nodes(monkeypatch):
+    monkeypatch.setattr(
+        nodes,
+        "NODE_CLASS_MAPPINGS",
+        {
+            "DummyLoader": DummyLoader,
+            "DummyPreview": DummyPreview,
+            "DummyCheckpointLoader": DummyCheckpointLoader,
+        },
+    )
+    monkeypatch.setattr(nodes, "NODE_DISPLAY_NAME_MAPPINGS", {})
+
+    catalog = copilot_manager.build_relevant_node_catalog(
+        query="preview",
+        workflow_api={
+            "1": {"class_type": "DummyCheckpointLoader", "inputs": {"ckpt_name": "installed.safetensors"}},
+        },
+        limit=10,
+    )
+
+    class_types = {entry["class_type"] for entry in catalog}
+    assert "DummyCheckpointLoader" in class_types
+
+
 def test_lint_workflow_connections_reports_missing_required_input(monkeypatch):
     monkeypatch.setattr(
         nodes,
