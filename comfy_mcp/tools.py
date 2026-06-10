@@ -15,13 +15,13 @@ COMFYUI_TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "name": "search_nodes",
             "description": (
                 "Search installed ComfyUI nodes (core + custom) by name, category, or keyword. "
-                "Use before wiring unfamiliar nodes."
+                "Returns class_type names only — call get_node_info for wiring details."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Search text, e.g. 'KSampler' or 'load image'"},
-                    "limit": {"type": "integer", "description": "Max results (default 15)", "default": 15},
+                    "limit": {"type": "integer", "description": "Max results (default 12)", "default": 12},
                 },
                 "required": ["query"],
             },
@@ -31,7 +31,7 @@ COMFYUI_TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "get_node_info",
-            "description": "Get full input/output schema for one node class_type.",
+            "description": "Get input/output schema for one node class_type (single node only).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -54,7 +54,7 @@ COMFYUI_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                         "description": "Model folder: checkpoints, loras, vae, controlnet, etc.",
                         "default": "checkpoints",
                     },
-                    "limit": {"type": "integer", "default": 25},
+                    "limit": {"type": "integer", "default": 20},
                 },
             },
         },
@@ -99,16 +99,20 @@ async def execute_tool(name: str, arguments: dict[str, Any] | None = None) -> di
     return await _execute_tool_local(name, arguments)
 
 
+async def execute_copilot_tool(name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    """In-process MCP tools for ComfyUI Copilot (never loads the full node catalog)."""
+    return await _execute_tool_local(name, arguments or {})
+
+
 async def _execute_tool_local(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     from app import copilot_manager
 
     if name == "search_nodes":
         query = str(arguments.get("query") or "")
-        limit = int(arguments.get("limit") or 15)
-        nodes_list = copilot_manager.build_relevant_node_catalog(
+        limit = int(arguments.get("limit") or 12)
+        nodes_list = copilot_manager.search_node_class_types(
             query=query,
-            workflow_api={},
-            limit=max(1, min(limit, 40)),
+            limit=max(1, min(limit, 25)),
         )
         return {"nodes": nodes_list, "total": len(nodes_list)}
 
@@ -116,33 +120,25 @@ async def _execute_tool_local(name: str, arguments: dict[str, Any]) -> dict[str,
         class_type = str(arguments.get("class_type") or "").strip()
         if not class_type:
             return {"error": "class_type is required"}
-        catalog = copilot_manager.build_node_catalog(query=class_type, limit=5)
-        for entry in catalog:
-            if entry.get("class_type") == class_type:
-                return {"node": entry}
-        import nodes
-
-        if class_type in nodes.NODE_CLASS_MAPPINGS:
-            info = copilot_manager._node_info(class_type)
-            return {
-                "node": {
-                    "class_type": class_type,
-                    "display_name": info.get("display_name") or class_type,
-                    "inputs": copilot_manager._compact_inputs(info.get("input", {})),
-                    "output_slots": copilot_manager._build_output_slots(info),
-                    "output_node": bool(info.get("output_node", False)),
-                }
-            }
+        entry = copilot_manager.get_node_info_entry(class_type)
+        if entry:
+            return {"node": entry}
         return {"error": f"Unknown class_type: {class_type}"}
 
     if name == "list_model_files":
         folder = str(arguments.get("folder") or "checkpoints")
-        limit = int(arguments.get("limit") or 25)
-        models = copilot_manager.build_model_context(limit_per_folder=max(1, min(limit, 50)))
+        limit = int(arguments.get("limit") or 20)
+        models = copilot_manager.build_model_context(limit_per_folder=max(1, min(limit, 30)))
         return {"folder": folder, "files": models.get(folder, [])}
 
     if name == "get_hardware":
-        return copilot_manager.build_hardware_context()
+        hardware = copilot_manager.build_hardware_context()
+        return {
+            "cpu_only": hardware.get("cpu_only"),
+            "vram_total_gb": hardware.get("vram_total_gb"),
+            "vram_free_gb": hardware.get("vram_free_gb"),
+            "recommendations": hardware.get("recommendations"),
+        }
 
     if name == "validate_workflow":
         workflow_api = arguments.get("workflow_api") or {}
@@ -160,12 +156,28 @@ async def _execute_tool_http(name: str, arguments: dict[str, Any]) -> dict[str, 
     timeout = aiohttp.ClientTimeout(total=60)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         if name == "search_nodes":
-            params = {"q": arguments.get("query", ""), "limit": int(arguments.get("limit") or 15)}
-            return await _http_json(session, "GET", f"{COMFYUI_HOST}/api/copilot/node_catalog", params=params)
+            params = {
+                "q": arguments.get("query", ""),
+                "limit": max(1, min(int(arguments.get("limit") or 12), 25)),
+            }
+            data = await _http_json(session, "GET", f"{COMFYUI_HOST}/api/copilot/node_catalog", params=params)
+            nodes_list = data.get("nodes") or []
+            slim = [
+                {
+                    "class_type": node.get("class_type"),
+                    "display_name": node.get("display_name"),
+                    "category": node.get("category"),
+                }
+                for node in nodes_list
+                if isinstance(node, dict) and node.get("class_type")
+            ]
+            return {"nodes": slim, "total": len(slim)}
 
         if name == "get_node_info":
-            class_type = str(arguments.get("class_type") or "")
-            params = {"q": class_type, "limit": 1, "full": "true"}
+            class_type = str(arguments.get("class_type") or "").strip()
+            if not class_type:
+                return {"error": "class_type is required"}
+            params = {"class_type": class_type}
             data = await _http_json(session, "GET", f"{COMFYUI_HOST}/api/copilot/node_catalog", params=params)
             nodes_list = data.get("nodes") or []
             if nodes_list:
@@ -176,7 +188,7 @@ async def _execute_tool_http(name: str, arguments: dict[str, Any]) -> dict[str, 
         if name == "list_model_files":
             folder = str(arguments.get("folder") or "checkpoints")
             data = await _http_json(session, "GET", f"{COMFYUI_HOST}/models/{folder}")
-            limit = int(arguments.get("limit") or 25)
+            limit = int(arguments.get("limit") or 20)
             files = data if isinstance(data, list) else data.get(folder, [])
             return {"folder": folder, "files": (files or [])[:limit]}
 

@@ -60,10 +60,17 @@ class CopilotManager:
 
         @routes.get("/copilot/node_catalog")
         async def node_catalog(request):
+            class_type = (request.rel_url.query.get("class_type") or "").strip()
+            if class_type:
+                entry = get_node_info_entry(class_type)
+                nodes_list = [entry] if entry else []
+                return web.json_response({"nodes": nodes_list, "total": len(nodes_list)})
+
             query = request.rel_url.query.get("q", "")
-            limit = _parse_int(request.rel_url.query.get("limit"), 200)
-            full = request.rel_url.query.get("full", "false").lower() == "true"
-            catalog = build_node_catalog(query=query, limit=None if full else limit)
+            limit = _parse_int(request.rel_url.query.get("limit"), 50)
+            limit = max(1, min(limit, 100))
+            detailed = request.rel_url.query.get("full", "false").lower() == "true"
+            catalog = build_node_catalog(query=query, limit=limit, detailed=detailed)
             return web.json_response({"nodes": catalog, "total": len(catalog)})
 
         @routes.get("/copilot/hardware")
@@ -159,7 +166,7 @@ class CopilotManager:
                 await response.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
 
             try:
-                await emit("status", text="Reading current workflow and installed node catalog.")
+                await emit("status", text="Reading the current workflow.")
                 settings = _llm_settings_from_request(request, body)
                 prompt = (body.get("prompt") or "").strip()
                 if not prompt:
@@ -451,14 +458,17 @@ class CopilotManager:
         *,
         temperature: float,
         max_tokens: int,
-        max_tool_rounds: int = 8,
+        max_tool_rounds: int = 6,
     ) -> str:
-        from comfy_mcp.tools import execute_tool
+        from comfy_mcp.tools import execute_copilot_tool
 
         working = list(messages)
         provider = settings.get("provider", "openai")
 
-        for _ in range(max_tool_rounds):
+        for round_index in range(max_tool_rounds):
+            working = trim_messages_for_llm_budget(working)
+            _log_llm_payload_size(working, round_index=round_index)
+
             if provider == "anthropic":
                 content, tool_uses = await self._call_anthropic_with_tools(
                     settings, working, temperature=temperature, max_tokens=max_tokens
@@ -472,12 +482,12 @@ class CopilotManager:
                 working.append({"role": "assistant", "content": content})
                 tool_results = []
                 for tool_use in tool_uses:
-                    result = await execute_tool(tool_use["name"], tool_use.get("input") or {})
+                    result = await execute_copilot_tool(tool_use["name"], tool_use.get("input") or {})
                     tool_results.append(
                         {
                             "type": "tool_result",
                             "tool_use_id": tool_use["id"],
-                            "content": json.dumps(result, ensure_ascii=False)[:12000],
+                            "content": serialize_tool_result_for_llm(result),
                         }
                     )
                 working.append({"role": "user", "content": tool_results})
@@ -501,12 +511,12 @@ class CopilotManager:
                     arguments = json.loads(function.get("arguments") or "{}")
                 except json.JSONDecodeError:
                     arguments = {}
-                result = await execute_tool(name, arguments)
+                result = await execute_copilot_tool(name, arguments)
                 working.append(
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.get("id"),
-                        "content": json.dumps(result, ensure_ascii=False)[:12000],
+                        "content": serialize_tool_result_for_llm(result),
                     }
                 )
 
@@ -742,8 +752,11 @@ ESSENTIAL_NODE_TYPES = frozenset(
     }
 )
 
-# Rough character budget for the JSON user payload (~30-40k tokens with headroom under 128k total).
-COPILOT_CONTEXT_CHAR_BUDGET = 100_000
+# Rough character budget for the JSON user payload (~20-25k tokens with headroom under 128k total).
+COPILOT_CONTEXT_CHAR_BUDGET = 60_000
+# Hard cap on serialized chat messages sent to the LLM (~100k tokens under a 128k model limit).
+LLM_MESSAGE_CHAR_BUDGET = 360_000
+TOOL_RESULT_CHAR_LIMIT = 3_500
 
 
 def build_copilot_messages(
@@ -756,13 +769,13 @@ def build_copilot_messages(
     repair_context: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
     compact_history = []
-    for message in history[-6:]:
+    for message in history[-4:]:
         role = message.get("role", "user")
         if role in {"ai", "assistant"}:
             role = "assistant"
         elif role != "user":
             continue
-        compact_history.append({"role": role, "content": str(message.get("content", ""))[:900]})
+        compact_history.append({"role": role, "content": str(message.get("content", ""))[:600]})
 
     slim_repair = _slim_repair_context(repair_context) if repair_context else None
     hardware = build_hardware_context()
@@ -802,6 +815,7 @@ def build_relevant_node_catalog(
     workflow_api: dict[str, Any],
     repair_context: dict[str, Any] | None = None,
     limit: int = 100,
+    hydrate_schemas: bool = True,
 ) -> list[dict[str, Any]]:
     pinned: set[str] = set(ESSENTIAL_NODE_TYPES)
     for node in (workflow_api or {}).values():
@@ -818,21 +832,21 @@ def build_relevant_node_catalog(
             if isinstance(hint, dict) and hint.get("class_type"):
                 pinned.add(str(hint["class_type"]))
 
-    terms = [term.lower() for term in re.findall(r"[a-zA-Z0-9_./-]+", query or "") if len(term) > 2]
-    scored: list[tuple[int, str, dict[str, Any]]] = []
-    for class_type in nodes.NODE_CLASS_MAPPINGS:
-        try:
-            info = _node_info(class_type)
-        except Exception:
-            continue
-        entry = _minimal_catalog_entry(class_type, info)
-        score = _score_catalog_entry(entry, terms)
-        if class_type in pinned:
-            score += 1000
-        scored.append((score, class_type, entry))
+    hits = search_node_class_types(query=query, pinned=pinned, limit=limit)
+    if not hydrate_schemas:
+        return hits
 
-    scored.sort(key=lambda item: (-item[0], item[1]))
-    return [entry for _, _, entry in scored[:limit]]
+    catalog: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for hit in hits:
+        class_type = hit["class_type"]
+        if class_type in seen:
+            continue
+        seen.add(class_type)
+        entry = get_node_info_entry(class_type)
+        if entry:
+            catalog.append(entry)
+    return catalog[:limit]
 
 
 def _minimal_catalog_entry(class_type: str, info: dict[str, Any]) -> dict[str, Any]:
@@ -1457,20 +1471,75 @@ def _model_destination_path(folder: str, filename: str) -> str:
     return destination
 
 
-def build_node_catalog(query: str = "", limit: int | None = 200) -> list[dict[str, Any]]:
+def search_node_class_types(
+    *,
+    query: str = "",
+    pinned: set[str] | None = None,
+    limit: int = 15,
+) -> list[dict[str, Any]]:
+    """Lightweight node search — names/categories only, no INPUT_TYPES scan."""
     terms = [term.lower() for term in re.findall(r"[a-zA-Z0-9_./-]+", query or "") if len(term) > 2]
-    catalog = []
-    for class_type in sorted(nodes.NODE_CLASS_MAPPINGS):
-        try:
-            info = _node_info(class_type)
-        except Exception:
-            logging.exception("Failed to read node metadata for %s", class_type)
+    pinned = pinned or set()
+    scored: list[tuple[int, str]] = []
+
+    for class_type in nodes.NODE_CLASS_MAPPINGS:
+        display_name = nodes.NODE_DISPLAY_NAME_MAPPINGS.get(class_type, class_type)
+        category = str(getattr(nodes.NODE_CLASS_MAPPINGS[class_type], "CATEGORY", ""))[:80]
+        haystack = f"{class_type} {display_name} {category}".lower()
+        score = sum(1 for term in terms if term in haystack) if terms else 0
+        if class_type in pinned:
+            score += 1000
+        if terms and score == 0 and class_type not in pinned:
             continue
-        entry = {
+        scored.append((score, class_type))
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for _, class_type in scored:
+        if class_type in seen:
+            continue
+        seen.add(class_type)
+        ordered.append(class_type)
+        if len(ordered) >= limit:
+            break
+    for class_type in sorted(pinned):
+        if class_type in nodes.NODE_CLASS_MAPPINGS and class_type not in seen:
+            ordered.insert(0, class_type)
+            seen.add(class_type)
+        if len(ordered) >= limit:
+            break
+
+    results: list[dict[str, Any]] = []
+    for class_type in ordered[:limit]:
+        display_name = nodes.NODE_DISPLAY_NAME_MAPPINGS.get(class_type, class_type)
+        category = str(getattr(nodes.NODE_CLASS_MAPPINGS[class_type], "CATEGORY", ""))[:80]
+        results.append(
+            {
+                "class_type": class_type,
+                "display_name": display_name,
+                "category": category,
+            }
+        )
+    return results
+
+
+def get_node_info_entry(class_type: str, *, detailed: bool = False) -> dict[str, Any] | None:
+    """Return schema for one node without scanning the full catalog."""
+    class_type = (class_type or "").strip()
+    if not class_type or class_type not in nodes.NODE_CLASS_MAPPINGS:
+        return None
+    try:
+        info = _node_info(class_type)
+    except Exception:
+        logging.exception("Failed to read node metadata for %s", class_type)
+        return None
+    if detailed:
+        return {
             "class_type": class_type,
             "display_name": info.get("display_name") or class_type,
             "category": info.get("category", ""),
-            "description": str(info.get("description", ""))[:700],
+            "description": str(info.get("description", ""))[:400],
             "inputs": _compact_inputs(info.get("input", {})),
             "outputs": info.get("output", []),
             "output_names": info.get("output_name", []),
@@ -1478,12 +1547,89 @@ def build_node_catalog(query: str = "", limit: int | None = 200) -> list[dict[st
             "output_node": bool(info.get("output_node", False)),
             "python_module": info.get("python_module", ""),
         }
-        score = _score_catalog_entry(entry, terms)
-        catalog.append((score, entry))
+    return _minimal_catalog_entry(class_type, info)
 
-    catalog.sort(key=lambda item: (-item[0], item[1]["class_type"]))
-    entries = [entry for _, entry in catalog]
-    return entries if limit is None else entries[:limit]
+
+def build_node_catalog(query: str = "", limit: int | None = 50, *, detailed: bool = False) -> list[dict[str, Any]]:
+    if limit is None:
+        limit = 50
+    limit = max(1, min(int(limit), 100))
+    hits = search_node_class_types(query=query, limit=limit)
+    catalog: list[dict[str, Any]] = []
+    for hit in hits:
+        entry = get_node_info_entry(hit["class_type"], detailed=detailed)
+        if entry:
+            catalog.append(entry)
+    return catalog
+
+
+def serialize_tool_result_for_llm(result: dict[str, Any]) -> str:
+    payload = json.dumps(_json_safe(result), ensure_ascii=False)
+    if len(payload) <= TOOL_RESULT_CHAR_LIMIT:
+        return payload
+    return payload[:TOOL_RESULT_CHAR_LIMIT]
+
+
+def estimate_messages_char_size(messages: list[dict[str, Any]]) -> int:
+    return len(json.dumps(messages, ensure_ascii=False, default=str))
+
+
+def trim_messages_for_llm_budget(
+    messages: list[dict[str, Any]],
+    char_budget: int = LLM_MESSAGE_CHAR_BUDGET,
+) -> list[dict[str, Any]]:
+    if not messages:
+        return messages
+    if estimate_messages_char_size(messages) <= char_budget:
+        return messages
+
+    system_messages = [message for message in messages if message.get("role") == "system"]
+    other_messages = [message for message in messages if message.get("role") != "system"]
+
+    def shrink_tool_content(message: dict[str, Any]) -> dict[str, Any]:
+        message = dict(message)
+        content = message.get("content")
+        if message.get("role") == "tool" and isinstance(content, str) and len(content) > 800:
+            message["content"] = content[:800] + "…"
+        elif message.get("role") == "user" and isinstance(content, list):
+            trimmed_blocks = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    block = dict(block)
+                    text = str(block.get("content") or "")
+                    if len(text) > 800:
+                        block["content"] = text[:800] + "…"
+                trimmed_blocks.append(block)
+            message["content"] = trimmed_blocks
+        elif isinstance(content, str) and len(content) > 4000:
+            message["content"] = content[:4000] + "…"
+        return message
+
+    other_messages = [shrink_tool_content(message) for message in other_messages]
+    while other_messages and estimate_messages_char_size(system_messages + other_messages) > char_budget:
+        if len(other_messages) <= 2:
+            other_messages = [shrink_tool_content(other_messages[-1])]
+            break
+        other_messages.pop(0)
+
+    trimmed = system_messages + other_messages
+    if estimate_messages_char_size(trimmed) > char_budget:
+        raise ValueError(
+            "Copilot context is too large for the selected model. "
+            "Clear chat history, simplify the graph, or use a model with a larger context window."
+        )
+    return trimmed
+
+
+def _log_llm_payload_size(messages: list[dict[str, Any]], *, round_index: int) -> None:
+    size = estimate_messages_char_size(messages)
+    logging.info(
+        "ComfyUI Copilot LLM payload round=%s messages=%s chars=%s est_tokens=%s",
+        round_index,
+        len(messages),
+        size,
+        size // 4,
+    )
 
 
 def _node_info(node_class: str) -> dict[str, Any]:

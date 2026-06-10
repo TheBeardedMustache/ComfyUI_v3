@@ -276,6 +276,35 @@ def test_build_relevant_node_catalog_prioritizes_workflow_nodes(monkeypatch):
     assert "DummyCheckpointLoader" in class_types
 
 
+def test_get_node_info_entry_returns_single_node(monkeypatch):
+    monkeypatch.setattr(
+        nodes,
+        "NODE_CLASS_MAPPINGS",
+        {
+            "DummyLoader": DummyLoader,
+            "DummyPreview": DummyPreview,
+        },
+    )
+    monkeypatch.setattr(nodes, "NODE_DISPLAY_NAME_MAPPINGS", {})
+
+    entry = copilot_manager.get_node_info_entry("DummyPreview")
+    assert entry is not None
+    assert entry["class_type"] == "DummyPreview"
+    assert "inputs" in entry
+
+
+def test_trim_messages_for_llm_budget_drops_old_messages():
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "x" * 5000},
+        {"role": "assistant", "content": "y" * 5000},
+        {"role": "user", "content": "latest"},
+    ]
+    trimmed = copilot_manager.trim_messages_for_llm_budget(messages, char_budget=8000)
+    assert trimmed[-1]["content"] == "latest"
+    assert len(trimmed) < len(messages)
+
+
 def test_lint_workflow_connections_reports_missing_required_input(monkeypatch):
     monkeypatch.setattr(
         nodes,

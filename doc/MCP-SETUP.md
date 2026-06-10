@@ -2,7 +2,7 @@
 
 ComfyUI includes a stdio MCP server so Cursor, Claude Desktop, and other MCP clients can look up nodes and models **on demand** instead of loading the entire node catalog into LLM context.
 
-ComfyUI Copilot uses the same tool implementations in-process automatically.
+ComfyUI Copilot uses the same MCP tool implementations **in-process** (`execute_copilot_tool`) so your selected model in Copilot settings is used directly. Node schemas are fetched one at a time via `search_nodes` / `get_node_info` — the full node catalog is never injected into LLM context.
 
 ## Prerequisites
 

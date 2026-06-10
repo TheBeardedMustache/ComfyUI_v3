@@ -76,7 +76,13 @@ async function sendCopilotMessage(prompt) {
     ...payload,
     prompt,
     execute: wantsExecution(prompt),
-    messages: state.messages.slice(-12),
+    messages: state.messages
+      .filter((message) => message.role === "user" || message.role === "assistant")
+      .slice(-6)
+      .map((message) => ({
+        role: message.role,
+        content: String(message.content || "").slice(0, 800),
+      })),
     execution_errors: state.lastExecutionErrors.slice(-6),
   };
   state.messages.push({ role: "user", content: prompt });
