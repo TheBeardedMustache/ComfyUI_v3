@@ -56,6 +56,13 @@ python3 main.py --cpu   # verify http://127.0.0.1:8188/ returns 200
 
 Inference tests (`tests/inference`) require SDXL checkpoint files in `models/checkpoints/` and are not needed for basic dev setup.
 
+### ComfyUI Copilot
+
+- Backend: `app/copilot_manager.py`
+- Frontend extension: `web_extensions/comfyui_copilot/copilot.js` (sidebar tab via `app.extensionManager.registerSidebarTab`)
+- Single agent with server-side validation/repair loop; edits merge into the current graph (positions preserved for existing nodes)
+- Copilot unit tests: run `tests-unit/app_test/copilot_manager_test.py` in isolation (it mocks `sys.modules` at import time)
+
 ### Gotchas
 
 - No GPU in cloud VMs: always pass `--cpu` for local server runs and tests.

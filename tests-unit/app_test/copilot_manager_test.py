@@ -176,3 +176,58 @@ def test_collect_missing_models_merges_declared_download(monkeypatch):
 def test_safe_model_filename_rejects_path_traversal():
     assert copilot_manager._safe_model_filename("../secret.safetensors") == ""
     assert copilot_manager._safe_model_filename("subdir/model.safetensors") == "subdir/model.safetensors"
+
+
+def test_merge_workflow_into_current_preserves_unmentioned_nodes():
+    current = {
+        "1": {"class_type": "DummyLoader", "inputs": {"image": "example.png"}},
+        "2": {"class_type": "DummyPreview", "inputs": {"images": ["1", 0]}},
+    }
+    candidate = {
+        "workflow": {
+            "2": {"class_type": "DummyPreview", "inputs": {"images": ["1", 0]}},
+            "3": {"class_type": "DummyLoader", "inputs": {"image": "other.png"}},
+        },
+        "removed_node_ids": [],
+    }
+
+    merged = copilot_manager.merge_workflow_into_current(current, candidate)
+
+    assert "1" in merged
+    assert "2" in merged
+    assert "3" in merged
+    assert merged["3"]["inputs"]["image"] == "other.png"
+
+
+def test_merge_workflow_into_current_honors_removed_node_ids():
+    current = {
+        "1": {"class_type": "DummyLoader", "inputs": {"image": "example.png"}},
+        "2": {"class_type": "DummyPreview", "inputs": {"images": ["1", 0]}},
+    }
+    candidate = {"workflow": {"2": current["2"]}, "removed_node_ids": ["1"]}
+
+    merged = copilot_manager.merge_workflow_into_current(current, candidate)
+
+    assert "1" not in merged
+    assert "2" in merged
+
+
+def test_lint_workflow_connections_reports_missing_required_input(monkeypatch):
+    monkeypatch.setattr(
+        nodes,
+        "NODE_CLASS_MAPPINGS",
+        {
+            "DummyLoader": DummyLoader,
+            "DummyPreview": DummyPreview,
+        },
+    )
+    monkeypatch.setattr(nodes, "NODE_DISPLAY_NAME_MAPPINGS", {})
+
+    issues = copilot_manager.lint_workflow_connections(
+        {
+            "1": {"class_type": "DummyLoader", "inputs": {"image": "example.png"}},
+            "2": {"class_type": "DummyPreview", "inputs": {}},
+        }
+    )
+
+    assert any("missing required input" in issue for issue in issues)

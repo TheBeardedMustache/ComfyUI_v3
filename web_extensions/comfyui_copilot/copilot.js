@@ -2,12 +2,15 @@ import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
 const STORAGE_PREFIX = "comfyuiCopilot.";
+const COPILOT_TAB_ID = "comfyui-copilot";
+
 const state = {
-  open: false,
   busy: false,
   messages: [],
   lastWorkflow: null,
   pendingDownloads: [],
+  lastExecutionErrors: [],
+  panelRoot: null,
 };
 
 function setting(name, fallback = "") {
@@ -26,9 +29,7 @@ function headersFromSettings() {
     "X-Copilot-Model": setting("model", "gpt-4o-mini"),
   };
   const apiKey = setting("apiKey");
-  if (apiKey) {
-    headers["X-Copilot-Api-Key"] = apiKey;
-  }
+  if (apiKey) headers["X-Copilot-Api-Key"] = apiKey;
   return headers;
 }
 
@@ -49,9 +50,7 @@ async function readJsonLineStream(response, onEvent) {
     throw new Error(`Copilot request failed: HTTP ${response.status} ${await response.text()}`);
   }
   const reader = response.body?.getReader();
-  if (!reader) {
-    throw new Error("Copilot response did not include a stream.");
-  }
+  if (!reader) throw new Error("Copilot response did not include a stream.");
   const decoder = new TextDecoder();
   let buffer = "";
   while (true) {
@@ -61,23 +60,24 @@ async function readJsonLineStream(response, onEvent) {
     const lines = buffer.split("\n");
     buffer = lines.pop() || "";
     for (const line of lines) {
-      if (line.trim()) {
-        onEvent(JSON.parse(line));
-      }
+      if (line.trim()) onEvent(JSON.parse(line));
     }
   }
-  if (buffer.trim()) {
-    onEvent(JSON.parse(buffer));
-  }
+  if (buffer.trim()) onEvent(JSON.parse(buffer));
 }
 
-async function sendCopilotMessage(prompt, execute = false) {
+function wantsExecution(prompt) {
+  return /\b(run|execute|queue|render|generate|start)\b/i.test(prompt);
+}
+
+async function sendCopilotMessage(prompt) {
   const payload = await currentGraphPayload();
   const body = {
     ...payload,
     prompt,
-    execute,
-    messages: state.messages.slice(-10),
+    execute: wantsExecution(prompt),
+    messages: state.messages.slice(-12),
+    execution_errors: state.lastExecutionErrors.slice(-6),
   };
   state.messages.push({ role: "user", content: prompt });
   renderMessages();
@@ -89,65 +89,57 @@ async function sendCopilotMessage(prompt, execute = false) {
       headers: headersFromSettings(),
       body: JSON.stringify(body),
     });
+    let finalEvent = null;
     await readJsonLineStream(response, async (event) => {
       if (event.type === "status") {
         appendTransient(event.text || "Working...");
       } else if (event.type === "error") {
-        appendMessage("assistant", `Copilot error: ${event.error}`);
+        appendMessage("assistant", `Error: ${event.error}`);
       } else if (event.type === "final") {
-        state.lastWorkflow = event.workflow_api || null;
-        const text = event.text || "Workflow edit is ready.";
-        const missingModels = event.missing_models || event.validation?.missing_models || [];
-        appendMessage("assistant", text);
-        if (event.workflow_api) {
-          await applyWorkflowToCurrentGraph(event.workflow_api);
-          appendMessage(
-            "assistant",
-            missingModels.length
-              ? "Applied the edit to the current graph and laid it out. It needs model downloads before it can validate and run."
-              : "Applied the validated edit to the current graph and laid it out without overlaps."
-          );
-        }
-        if (missingModels.length) {
-          state.pendingDownloads = missingModels;
-          appendDownloadApproval(missingModels, Boolean(body.execute));
-        } else if (event.validation && !event.validation.success) {
-          appendMessage("assistant", `Validation still needs attention: ${JSON.stringify(event.validation)}`);
-        }
+        finalEvent = event;
       }
     });
+
+    if (!finalEvent) return;
+
+    state.lastWorkflow = finalEvent.workflow_api || null;
+    const missingModels = finalEvent.missing_models || finalEvent.validation?.missing_models || [];
+    let text = finalEvent.text || "Done.";
+
+    if (finalEvent.workflow_api) {
+      await applyWorkflowToCurrentGraph(finalEvent.workflow_api);
+      if (finalEvent.validation?.success && !missingModels.length) {
+        text = `${text}\n\nApplied changes to the current graph.`;
+      } else if (missingModels.length) {
+        text = `${text}\n\nGraph updated. Approve model downloads below to run it.`;
+      } else if (!finalEvent.validation?.success) {
+        text = `${text}\n\nPartial changes applied — ask me to fix remaining issues.`;
+      } else {
+        text = `${text}\n\nApplied changes to the current graph.`;
+      }
+    }
+
+    appendMessage("assistant", text);
+
+    if (missingModels.length) {
+      state.pendingDownloads = missingModels;
+      appendDownloadApproval(missingModels, Boolean(body.execute));
+    }
+
+    if (finalEvent.execution?.success) {
+      appendMessage("assistant", `Queued workflow ${finalEvent.execution.prompt_id}.`);
+      state.lastExecutionErrors = [];
+    }
   } finally {
     setBusy(false);
   }
-}
-
-async function validateCurrentGraph() {
-  const payload = await currentGraphPayload();
-  const response = await fetch("/api/copilot/validate", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  const result = await response.json();
-  appendMessage("assistant", result.success ? "Current workflow validates successfully." : `Validation issues: ${JSON.stringify(result)}`);
-}
-
-async function executeCurrentGraph() {
-  const payload = await currentGraphPayload();
-  const response = await fetch("/api/copilot/execute", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  const result = await response.json();
-  appendMessage("assistant", result.success ? `Queued workflow ${result.prompt_id}.` : `Could not execute: ${JSON.stringify(result)}`);
 }
 
 async function approveModelDownloads(downloads, executeAfterDownload = false) {
   if (!downloads?.length) return;
   setBusy(true);
   try {
-    appendMessage("assistant", `Downloading ${downloads.length} approved model file(s)...`);
+    appendMessage("assistant", `Downloading ${downloads.length} model file(s)...`);
     const response = await fetch("/api/copilot/download_models", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -155,13 +147,21 @@ async function approveModelDownloads(downloads, executeAfterDownload = false) {
     });
     const result = await response.json();
     if (!response.ok || !result.success) {
-      appendMessage("assistant", `One or more model downloads failed: ${JSON.stringify(result)}`);
+      appendMessage("assistant", `Download failed: ${JSON.stringify(result)}`);
       return;
     }
-    appendMessage("assistant", `Model downloads complete: ${result.results.map((item) => `${item.folder}/${item.filename}`).join(", ")}`);
-    await validateCurrentGraph();
+    appendMessage("assistant", "Downloads complete. You can ask me to run the workflow.");
     if (executeAfterDownload) {
-      await executeCurrentGraph();
+      const payload = await currentGraphPayload();
+      const exec = await fetch("/api/copilot/execute", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const execResult = await exec.json();
+      if (execResult.success) {
+        appendMessage("assistant", `Queued workflow ${execResult.prompt_id}.`);
+      }
     }
   } finally {
     setBusy(false);
@@ -172,30 +172,49 @@ async function applyWorkflowToCurrentGraph(workflowApi) {
   if (!workflowApi || typeof workflowApi !== "object") {
     throw new Error("Copilot returned an invalid workflow.");
   }
-  if (typeof app.loadApiJson === "function") {
-    await app.loadApiJson(workflowApi);
-  } else {
+
+  const positions = new Map();
+  const graphNodes = app.graph?._nodes || app.graph?.nodes || [];
+  for (const node of graphNodes) {
+    positions.set(String(node.id), node.pos ? [...node.pos] : null);
+  }
+  const previousIds = new Set(positions.keys());
+
+  if (typeof app.loadApiJson !== "function") {
     throw new Error("This ComfyUI frontend does not expose loadApiJson().");
   }
-  layoutGraphNoOverlap();
+  await app.loadApiJson(workflowApi);
+
+  const updatedNodes = app.graph?._nodes || app.graph?.nodes || [];
+  const newNodeIds = [];
+  for (const node of updatedNodes) {
+    const id = String(node.id);
+    const saved = positions.get(id);
+    if (saved) {
+      node.pos = saved;
+    } else if (!previousIds.has(id)) {
+      newNodeIds.push(node);
+    }
+  }
+
+  if (newNodeIds.length) {
+    layoutNewNodes(newNodeIds, positions);
+  }
+
   app.graph?.setDirtyCanvas?.(true, true);
 }
 
-function layoutGraphNoOverlap() {
+function layoutNewNodes(newNodes, existingPositions) {
   const graph = app.graph;
-  const graphNodes = graph?._nodes || graph?.nodes || [];
-  if (!graph || !graphNodes.length) return;
+  const links = Object.values(graph?.links || {});
+  const ranks = new Map(newNodes.map((node) => [String(node.id), 0]));
 
-  const nodeById = new Map(graphNodes.map((node) => [String(node.id), node]));
-  const ranks = new Map(graphNodes.map((node) => [String(node.id), 0]));
-  const links = Object.values(graph.links || {});
-
-  for (let iteration = 0; iteration < graphNodes.length + 2; iteration++) {
+  for (let i = 0; i < newNodes.length + 2; i++) {
     let changed = false;
     for (const link of links) {
       const origin = String(link?.origin_id ?? link?.[1] ?? "");
       const target = String(link?.target_id ?? link?.[3] ?? "");
-      if (!nodeById.has(origin) || !nodeById.has(target)) continue;
+      if (!ranks.has(origin) || !ranks.has(target)) continue;
       const nextRank = (ranks.get(origin) || 0) + 1;
       if (nextRank > (ranks.get(target) || 0)) {
         ranks.set(target, nextRank);
@@ -205,29 +224,34 @@ function layoutGraphNoOverlap() {
     if (!changed) break;
   }
 
+  let anchorX = 120;
+  let anchorY = 120;
+  for (const pos of existingPositions.values()) {
+    if (pos) {
+      anchorX = Math.max(anchorX, pos[0] + 420);
+      anchorY = Math.min(anchorY, pos[1]);
+    }
+  }
+
   const layers = new Map();
-  for (const node of graphNodes) {
+  for (const node of newNodes) {
     const rank = ranks.get(String(node.id)) || 0;
     if (!layers.has(rank)) layers.set(rank, []);
     layers.get(rank).push(node);
   }
 
-  const visible = app.canvas?.visible_area || [0, 0];
-  const startX = visible[0] + 80;
-  const startY = visible[1] + 80;
   const xSpacing = 360;
   const ySpacing = 90;
-
   [...layers.keys()].sort((a, b) => a - b).forEach((rank) => {
+    let cursorY = anchorY;
     const layer = layers.get(rank).sort((a, b) => String(a.id).localeCompare(String(b.id), undefined, { numeric: true }));
-    let cursorY = startY;
     for (const node of layer) {
       if (typeof node.computeSize === "function") {
         const computed = node.computeSize();
         if (computed) node.size = computed;
       }
       const height = Array.isArray(node.size) ? node.size[1] : 120;
-      node.pos = [startX + rank * xSpacing, cursorY];
+      node.pos = [anchorX + rank * xSpacing, cursorY];
       cursorY += Math.max(height, 120) + ySpacing;
     }
   });
@@ -253,7 +277,7 @@ function appendDownloadApproval(downloads, executeAfterDownload) {
   state.messages = state.messages.filter((message) => message.role !== "status");
   state.messages.push({
     role: "download_approval",
-    content: "This workflow needs model files that are not installed locally. Review the list and approve downloads if you want Copilot to fetch them into ComfyUI's model folders.",
+    content: "Missing model files detected. Approve to download into ComfyUI model folders.",
     downloads,
     executeAfterDownload,
   });
@@ -262,17 +286,17 @@ function appendDownloadApproval(downloads, executeAfterDownload) {
 
 function setBusy(busy) {
   state.busy = busy;
-  const panel = document.getElementById("comfyui-copilot-panel");
-  if (panel) {
-    panel.dataset.busy = busy ? "true" : "false";
-    panel.querySelectorAll("button, textarea, input, select").forEach((el) => {
-      if (!el.dataset.alwaysEnabled) el.disabled = busy;
-    });
-  }
+  const panel = state.panelRoot;
+  if (!panel) return;
+  const shell = panel.querySelector(".comfyui-copilot-shell");
+  if (shell) shell.dataset.busy = busy ? "true" : "false";
+  panel.querySelectorAll("button, textarea, input, select").forEach((el) => {
+    if (!el.dataset.alwaysEnabled) el.disabled = busy;
+  });
 }
 
 function renderMessages() {
-  const list = document.getElementById("comfyui-copilot-messages");
+  const list = state.panelRoot?.querySelector("#comfyui-copilot-messages");
   if (!list) return;
   list.replaceChildren();
   for (const message of state.messages) {
@@ -296,8 +320,7 @@ function renderDownloadApprovalMessage(container, message) {
   const list = document.createElement("ul");
   for (const download of message.downloads || []) {
     const row = document.createElement("li");
-    const url = download.url || "No URL provided";
-    row.textContent = `${download.folder}/${download.filename} - ${url}${download.reason ? ` (${download.reason})` : ""}`;
+    row.textContent = `${download.folder}/${download.filename}${download.reason ? ` — ${download.reason}` : ""}`;
     list.appendChild(row);
   }
   container.appendChild(list);
@@ -306,11 +329,11 @@ function renderDownloadApprovalMessage(container, message) {
   actions.className = "comfyui-copilot-download-actions";
 
   const approve = document.createElement("button");
-  approve.textContent = message.executeAfterDownload ? "Approve downloads + execute" : "Approve downloads";
+  approve.textContent = message.executeAfterDownload ? "Download + run" : "Download models";
   approve.onclick = () => {
     const missingUrls = (message.downloads || []).filter((download) => !download.url);
     if (missingUrls.length) {
-      appendMessage("assistant", `Cannot download yet; ${missingUrls.length} model(s) have no source URL.`);
+      appendMessage("assistant", `${missingUrls.length} model(s) have no download URL yet. Ask me to find sources.`);
       return;
     }
     approveModelDownloads(message.downloads, message.executeAfterDownload).catch((err) => appendMessage("assistant", err.message));
@@ -318,62 +341,64 @@ function renderDownloadApprovalMessage(container, message) {
   actions.appendChild(approve);
 
   const cancel = document.createElement("button");
-  cancel.textContent = "Skip downloads";
-  cancel.onclick = () => appendMessage("assistant", "Skipped model downloads. The workflow remains on the graph, but it may not execute until the missing models are installed.");
+  cancel.textContent = "Skip";
+  cancel.onclick = () => appendMessage("assistant", "Skipped downloads. The graph is updated but may not run until models are installed.");
   actions.appendChild(cancel);
   container.appendChild(actions);
 }
 
-function createPanel() {
-  injectStyles();
-  const button = document.createElement("button");
-  button.id = "comfyui-copilot-button";
-  button.textContent = "Copilot";
-  button.title = "Open local ComfyUI Copilot";
-  button.dataset.alwaysEnabled = "true";
-  button.onclick = () => togglePanel();
-  document.body.appendChild(button);
-
-  const panel = document.createElement("div");
-  panel.id = "comfyui-copilot-panel";
-  panel.innerHTML = `
-    <div class="comfyui-copilot-header">
-      <strong>Local Copilot</strong>
-      <button id="comfyui-copilot-close" data-always-enabled="true">x</button>
-    </div>
-    <div class="comfyui-copilot-settings">
-      <label>Provider
-        <select id="comfyui-copilot-provider">
-          <option value="openai">OpenAI-compatible</option>
-          <option value="anthropic">Anthropic</option>
-        </select>
-      </label>
-      <label>Base URL <input id="comfyui-copilot-base-url" autocomplete="off" /></label>
-      <label>Model <input id="comfyui-copilot-model" autocomplete="off" /></label>
-      <label>API key <input id="comfyui-copilot-api-key" type="password" autocomplete="off" placeholder="Stored in this browser only" /></label>
-    </div>
-    <div id="comfyui-copilot-messages"></div>
-    <textarea id="comfyui-copilot-input" placeholder="Ask Copilot to edit, fix, validate, or optimize the current graph..."></textarea>
-    <div class="comfyui-copilot-actions">
-      <button id="comfyui-copilot-send">Edit current graph</button>
-      <button id="comfyui-copilot-send-run">Edit + execute</button>
-      <button id="comfyui-copilot-validate">Validate</button>
-      <button id="comfyui-copilot-execute">Execute</button>
+function buildPanelMarkup() {
+  return `
+    <div class="comfyui-copilot-shell">
+      <header class="comfyui-copilot-header">
+        <div>
+          <strong>ComfyUI Copilot</strong>
+          <p class="comfyui-copilot-subtitle">Single agent — builds, fixes, and runs your graph</p>
+        </div>
+        <button type="button" class="comfyui-copilot-settings-toggle" data-always-enabled="true" title="Settings">⚙</button>
+      </header>
+      <section class="comfyui-copilot-settings collapsed">
+        <label>Provider
+          <select id="comfyui-copilot-provider">
+            <option value="openai">OpenAI-compatible</option>
+            <option value="anthropic">Anthropic</option>
+          </select>
+        </label>
+        <label>Base URL <input id="comfyui-copilot-base-url" autocomplete="off" /></label>
+        <label>Model <input id="comfyui-copilot-model" autocomplete="off" /></label>
+        <label>API key <input id="comfyui-copilot-api-key" type="password" autocomplete="off" placeholder="Stored locally in this browser" /></label>
+      </section>
+      <div id="comfyui-copilot-messages" class="comfyui-copilot-messages"></div>
+      <div class="comfyui-copilot-composer">
+        <textarea id="comfyui-copilot-input" placeholder="Ask anything: build a workflow, connect nodes, fix errors, download models, optimize for your GPU..."></textarea>
+        <button id="comfyui-copilot-send" type="button">Send</button>
+      </div>
     </div>
   `;
-  document.body.appendChild(panel);
+}
 
-  const provider = panel.querySelector("#comfyui-copilot-provider");
-  const baseUrl = panel.querySelector("#comfyui-copilot-base-url");
-  const model = panel.querySelector("#comfyui-copilot-model");
-  const apiKey = panel.querySelector("#comfyui-copilot-api-key");
+function wirePanel(root) {
+  state.panelRoot = root;
+  const provider = root.querySelector("#comfyui-copilot-provider");
+  const baseUrl = root.querySelector("#comfyui-copilot-base-url");
+  const model = root.querySelector("#comfyui-copilot-model");
+  const apiKey = root.querySelector("#comfyui-copilot-api-key");
+  const settings = root.querySelector(".comfyui-copilot-settings");
+  const settingsToggle = root.querySelector(".comfyui-copilot-settings-toggle");
+
   provider.value = setting("provider", "openai");
   baseUrl.value = setting("baseUrl", provider.value === "anthropic" ? "https://api.anthropic.com/v1" : "https://api.openai.com/v1");
   model.value = setting("model", provider.value === "anthropic" ? "claude-3-5-sonnet-latest" : "gpt-4o-mini");
   apiKey.value = setting("apiKey");
 
-  provider.onchange = () => {
+  const persistSettings = () => {
     setSetting("provider", provider.value);
+    setSetting("baseUrl", baseUrl.value);
+    setSetting("model", model.value);
+    setSetting("apiKey", apiKey.value);
+  };
+
+  provider.onchange = () => {
     if (!baseUrl.value || baseUrl.value.includes("api.openai.com") || baseUrl.value.includes("api.anthropic.com")) {
       baseUrl.value = provider.value === "anthropic" ? "https://api.anthropic.com/v1" : "https://api.openai.com/v1";
     }
@@ -384,43 +409,81 @@ function createPanel() {
   };
   [baseUrl, model, apiKey].forEach((el) => el.addEventListener("change", persistSettings));
 
-  panel.querySelector("#comfyui-copilot-close").onclick = () => togglePanel(false);
-  panel.querySelector("#comfyui-copilot-send").onclick = () => submitPrompt(false);
-  panel.querySelector("#comfyui-copilot-send-run").onclick = () => submitPrompt(true);
-  panel.querySelector("#comfyui-copilot-validate").onclick = () => validateCurrentGraph().catch((err) => appendMessage("assistant", err.message));
-  panel.querySelector("#comfyui-copilot-execute").onclick = () => executeCurrentGraph().catch((err) => appendMessage("assistant", err.message));
+  settingsToggle.onclick = () => settings.classList.toggle("collapsed");
 
-  const input = panel.querySelector("#comfyui-copilot-input");
+  root.querySelector("#comfyui-copilot-send").onclick = () => submitPrompt();
+  const input = root.querySelector("#comfyui-copilot-input");
   input.addEventListener("keydown", (event) => {
-    if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
-      submitPrompt(false);
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      submitPrompt();
     }
   });
+
+  renderMessages();
 }
 
-function persistSettings() {
-  setSetting("provider", document.getElementById("comfyui-copilot-provider")?.value);
-  setSetting("baseUrl", document.getElementById("comfyui-copilot-base-url")?.value);
-  setSetting("model", document.getElementById("comfyui-copilot-model")?.value);
-  setSetting("apiKey", document.getElementById("comfyui-copilot-api-key")?.value);
-}
-
-function submitPrompt(execute) {
-  const input = document.getElementById("comfyui-copilot-input");
-  const prompt = input.value.trim();
+function submitPrompt() {
+  const input = state.panelRoot?.querySelector("#comfyui-copilot-input");
+  const prompt = input?.value?.trim();
   if (!prompt || state.busy) return;
-  persistSettings();
+  setSetting("provider", state.panelRoot.querySelector("#comfyui-copilot-provider")?.value);
+  setSetting("baseUrl", state.panelRoot.querySelector("#comfyui-copilot-base-url")?.value);
+  setSetting("model", state.panelRoot.querySelector("#comfyui-copilot-model")?.value);
+  setSetting("apiKey", state.panelRoot.querySelector("#comfyui-copilot-api-key")?.value);
   input.value = "";
-  sendCopilotMessage(prompt, execute).catch((err) => {
+  sendCopilotMessage(prompt).catch((err) => {
     appendMessage("assistant", err.message);
     setBusy(false);
   });
 }
 
-function togglePanel(force) {
-  state.open = typeof force === "boolean" ? force : !state.open;
-  const panel = document.getElementById("comfyui-copilot-panel");
-  if (panel) panel.classList.toggle("open", state.open);
+function mountCopilotPanel(container) {
+  injectStyles();
+  container.classList.add("comfyui-copilot-host");
+  container.innerHTML = buildPanelMarkup();
+  wirePanel(container);
+}
+
+function unmountCopilotPanel() {
+  state.panelRoot = null;
+}
+
+function registerSidebarTab() {
+  const tab = {
+    id: COPILOT_TAB_ID,
+    icon: "icon-[lucide--sparkles]",
+    title: "Copilot",
+    tooltip: "ComfyUI Copilot",
+    type: "custom",
+    render: (el) => mountCopilotPanel(el),
+    destroy: () => unmountCopilotPanel(),
+  };
+
+  if (app.extensionManager?.registerSidebarTab) {
+    app.extensionManager.registerSidebarTab(tab);
+    return true;
+  }
+  return false;
+}
+
+function bindExecutionErrors() {
+  if (!api?.addEventListener) return;
+  api.addEventListener("execution_error", ({ detail }) => {
+    if (!detail) return;
+    state.lastExecutionErrors.push(detail);
+    if (state.lastExecutionErrors.length > 12) {
+      state.lastExecutionErrors = state.lastExecutionErrors.slice(-12);
+    }
+    const summary = [
+      detail.node_type ? `Node: ${detail.node_type}` : null,
+      detail.exception_message || detail.message || "Execution failed",
+    ].filter(Boolean).join(" — ");
+    appendMessage("assistant", `Execution error captured. Tell me to fix it, or ask "fix the error".\n${summary}`);
+  });
+  api.addEventListener("execution_success", () => {
+    state.lastExecutionErrors = [];
+  });
 }
 
 function injectStyles() {
@@ -428,58 +491,165 @@ function injectStyles() {
   const style = document.createElement("style");
   style.id = "comfyui-copilot-styles";
   style.textContent = `
-    #comfyui-copilot-button {
-      position: fixed; right: 18px; bottom: 18px; z-index: 10010;
-      border: 0; border-radius: 999px; padding: 10px 14px;
-      background: #3b82f6; color: white; font-weight: 700; cursor: pointer;
-      box-shadow: 0 8px 20px rgba(0,0,0,.3);
+    .comfyui-copilot-host {
+      height: 100%;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      background: var(--comfy-menu-bg, #1a1b1e);
+      color: var(--fg-color, #ececec);
+      font: 13px/1.45 Inter, system-ui, sans-serif;
     }
-    #comfyui-copilot-panel {
-      position: fixed; right: 18px; bottom: 66px; z-index: 10010;
-      width: 390px; max-width: calc(100vw - 36px); height: min(720px, calc(100vh - 90px));
-      display: none; flex-direction: column; gap: 8px; padding: 12px;
-      background: var(--comfy-menu-bg, #202124); color: var(--fg-color, #f5f5f5);
-      border: 1px solid rgba(255,255,255,.14); border-radius: 12px;
-      box-shadow: 0 18px 40px rgba(0,0,0,.45); font: 13px sans-serif;
+    .comfyui-copilot-shell {
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+      min-height: 0;
+      gap: 10px;
+      padding: 12px;
+      box-sizing: border-box;
     }
-    #comfyui-copilot-panel.open { display: flex; }
-    .comfyui-copilot-header, .comfyui-copilot-actions { display: flex; align-items: center; gap: 8px; }
-    .comfyui-copilot-header { justify-content: space-between; }
-    .comfyui-copilot-header button, .comfyui-copilot-actions button {
-      border: 1px solid rgba(255,255,255,.18); border-radius: 7px; padding: 6px 8px;
-      background: rgba(255,255,255,.08); color: inherit; cursor: pointer;
+    .comfyui-copilot-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 8px;
     }
-    .comfyui-copilot-actions { flex-wrap: wrap; }
-    .comfyui-copilot-settings { display: grid; grid-template-columns: 1fr; gap: 6px; }
-    .comfyui-copilot-settings label { display: grid; gap: 3px; color: rgba(255,255,255,.78); }
-    .comfyui-copilot-settings input, .comfyui-copilot-settings select, #comfyui-copilot-input {
-      width: 100%; box-sizing: border-box; border-radius: 7px; border: 1px solid rgba(255,255,255,.16);
-      background: rgba(0,0,0,.25); color: inherit; padding: 7px;
+    .comfyui-copilot-subtitle {
+      margin: 2px 0 0;
+      font-size: 11px;
+      opacity: 0.72;
     }
-    #comfyui-copilot-messages {
-      flex: 1; overflow: auto; display: flex; flex-direction: column; gap: 8px;
-      border: 1px solid rgba(255,255,255,.10); border-radius: 8px; padding: 8px; min-height: 140px;
+    .comfyui-copilot-settings-toggle {
+      border: 1px solid rgba(255,255,255,.14);
+      background: rgba(255,255,255,.06);
+      color: inherit;
+      border-radius: 8px;
+      width: 32px;
+      height: 32px;
+      cursor: pointer;
     }
-    .comfyui-copilot-message { white-space: pre-wrap; line-height: 1.35; padding: 8px; border-radius: 8px; }
-    .comfyui-copilot-message.user { align-self: flex-end; background: rgba(59,130,246,.32); }
-    .comfyui-copilot-message.assistant { background: rgba(255,255,255,.08); }
-    .comfyui-copilot-message.status { color: #fbbf24; background: rgba(251,191,36,.12); }
-    .comfyui-copilot-message.download_approval { background: rgba(251,191,36,.14); border: 1px solid rgba(251,191,36,.35); }
-    .comfyui-copilot-message.download_approval ul { margin: 8px 0; padding-left: 18px; word-break: break-word; }
-    .comfyui-copilot-download-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    .comfyui-copilot-settings {
+      display: grid;
+      gap: 8px;
+      padding: 10px;
+      border-radius: 10px;
+      border: 1px solid rgba(255,255,255,.1);
+      background: rgba(0,0,0,.18);
+    }
+    .comfyui-copilot-settings.collapsed { display: none; }
+    .comfyui-copilot-settings label {
+      display: grid;
+      gap: 4px;
+      font-size: 11px;
+      opacity: 0.85;
+    }
+    .comfyui-copilot-settings input,
+    .comfyui-copilot-settings select,
+    #comfyui-copilot-input {
+      width: 100%;
+      box-sizing: border-box;
+      border-radius: 8px;
+      border: 1px solid rgba(255,255,255,.14);
+      background: rgba(0,0,0,.28);
+      color: inherit;
+      padding: 8px 10px;
+    }
+    .comfyui-copilot-messages {
+      flex: 1;
+      min-height: 0;
+      overflow: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding: 10px;
+      border-radius: 10px;
+      border: 1px solid rgba(255,255,255,.08);
+      background: rgba(0,0,0,.22);
+    }
+    .comfyui-copilot-message {
+      white-space: pre-wrap;
+      padding: 10px 12px;
+      border-radius: 10px;
+      max-width: 100%;
+    }
+    .comfyui-copilot-message.user {
+      align-self: flex-end;
+      background: linear-gradient(135deg, rgba(59,130,246,.45), rgba(99,102,241,.35));
+    }
+    .comfyui-copilot-message.assistant {
+      background: rgba(255,255,255,.07);
+    }
+    .comfyui-copilot-message.status {
+      color: #fbbf24;
+      background: rgba(251,191,36,.1);
+      font-size: 12px;
+    }
+    .comfyui-copilot-message.download_approval {
+      background: rgba(251,191,36,.12);
+      border: 1px solid rgba(251,191,36,.28);
+    }
+    .comfyui-copilot-message.download_approval ul {
+      margin: 8px 0;
+      padding-left: 18px;
+      word-break: break-word;
+    }
+    .comfyui-copilot-download-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 8px;
+    }
     .comfyui-copilot-download-actions button {
-      border: 1px solid rgba(255,255,255,.18); border-radius: 7px; padding: 6px 8px;
-      background: rgba(255,255,255,.10); color: inherit; cursor: pointer;
+      border: 1px solid rgba(255,255,255,.16);
+      border-radius: 8px;
+      padding: 6px 10px;
+      background: rgba(255,255,255,.1);
+      color: inherit;
+      cursor: pointer;
     }
-    #comfyui-copilot-input { height: 76px; resize: vertical; }
-    #comfyui-copilot-panel[data-busy="true"] .comfyui-copilot-actions button { opacity: .55; }
+    .comfyui-copilot-composer {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+      align-items: end;
+    }
+    #comfyui-copilot-input {
+      min-height: 72px;
+      resize: vertical;
+    }
+    #comfyui-copilot-send {
+      border: 0;
+      border-radius: 10px;
+      padding: 10px 16px;
+      font-weight: 600;
+      cursor: pointer;
+      color: white;
+      background: linear-gradient(135deg, #3b82f6, #6366f1);
+      height: fit-content;
+    }
+    .comfyui-copilot-shell[data-busy="true"] #comfyui-copilot-send {
+      opacity: 0.55;
+      cursor: wait;
+    }
   `;
   document.head.appendChild(style);
 }
 
+function waitForSidebarRegistration() {
+  if (registerSidebarTab()) return;
+  const started = Date.now();
+  const timer = setInterval(() => {
+    if (registerSidebarTab() || Date.now() - started > 30000) {
+      clearInterval(timer);
+    }
+  }, 300);
+}
+
 app.registerExtension({
   name: "Comfy.LocalCopilot",
-  setup() {
-    createPanel();
+  async setup() {
+    bindExecutionErrors();
+    waitForSidebarRegistration();
   },
 });
