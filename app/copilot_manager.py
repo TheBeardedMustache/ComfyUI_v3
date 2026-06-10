@@ -53,6 +53,7 @@ class CopilotManager:
                         "/api/copilot/node_catalog",
                         "/api/copilot/models",
                         "/api/copilot/hardware",
+                        "/api/copilot/mcp",
                     ],
                 }
             )
@@ -68,6 +69,18 @@ class CopilotManager:
         @routes.get("/copilot/hardware")
         async def hardware(request):
             return web.json_response(build_hardware_context())
+
+        @routes.get("/copilot/mcp")
+        async def mcp_info(request):
+            from comfy_mcp.tools import COMFYUI_TOOL_DEFINITIONS
+
+            return web.json_response(
+                {
+                    "stdio_command": "python3 -m comfy_mcp",
+                    "env": {"COMFYUI_HOST": "http://127.0.0.1:8188", "COMFY_MCP_USE_HTTP": "1"},
+                    "tools": [tool["function"]["name"] for tool in COMFYUI_TOOL_DEFINITIONS],
+                }
+            )
 
         @routes.get("/copilot/models")
         async def models(request):
@@ -271,7 +284,9 @@ class CopilotManager:
             current_ui_workflow=current_ui_workflow,
             execution_errors=execution_errors,
         )
-        text = await self._call_llm(settings, messages, temperature=0.15, max_tokens=16000)
+        text = await self._call_llm_agent_with_tools(
+            settings, messages, temperature=0.15, max_tokens=16000
+        )
         return _extract_json_object(text)
 
     async def _repair_workflow_edit(
@@ -295,12 +310,11 @@ class CopilotManager:
             repair_context={
                 "candidate": candidate,
                 "validation": summarize_validation_for_llm(validation),
-                "connection_hints": build_connection_hints_for_workflow(
-                    candidate.get("workflow") or candidate.get("workflow_api") or {}
-                ),
             },
         )
-        text = await self._call_llm(settings, messages, temperature=0.05, max_tokens=16000)
+        text = await self._call_llm_agent_with_tools(
+            settings, messages, temperature=0.05, max_tokens=16000
+        )
         return _extract_json_object(text)
 
     async def _validate_workflow(self, workflow_api: dict[str, Any], *, strict_topology: bool) -> dict[str, Any]:
@@ -430,6 +444,153 @@ class CopilotManager:
             settings, messages, temperature=temperature, max_tokens=max_tokens
         )
 
+    async def _call_llm_agent_with_tools(
+        self,
+        settings: dict[str, str],
+        messages: list[dict[str, str]],
+        *,
+        temperature: float,
+        max_tokens: int,
+        max_tool_rounds: int = 8,
+    ) -> str:
+        from comfy_mcp.tools import execute_tool
+
+        working = list(messages)
+        provider = settings.get("provider", "openai")
+
+        for _ in range(max_tool_rounds):
+            if provider == "anthropic":
+                content, tool_uses = await self._call_anthropic_with_tools(
+                    settings, working, temperature=temperature, max_tokens=max_tokens
+                )
+                if not tool_uses:
+                    text = _anthropic_text_from_content(content)
+                    if not text:
+                        raise ValueError("LLM returned an empty response.")
+                    return text
+
+                working.append({"role": "assistant", "content": content})
+                tool_results = []
+                for tool_use in tool_uses:
+                    result = await execute_tool(tool_use["name"], tool_use.get("input") or {})
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use["id"],
+                            "content": json.dumps(result, ensure_ascii=False)[:12000],
+                        }
+                    )
+                working.append({"role": "user", "content": tool_results})
+                continue
+
+            message = await self._call_openai_with_tools(
+                settings, working, temperature=temperature, max_tokens=max_tokens
+            )
+            tool_calls = message.get("tool_calls") or []
+            if not tool_calls:
+                text = message.get("content") or ""
+                if not text:
+                    raise ValueError("LLM returned an empty response.")
+                return text
+
+            working.append(message)
+            for tool_call in tool_calls:
+                function = tool_call.get("function") or {}
+                name = function.get("name") or ""
+                try:
+                    arguments = json.loads(function.get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    arguments = {}
+                result = await execute_tool(name, arguments)
+                working.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.get("id"),
+                        "content": json.dumps(result, ensure_ascii=False)[:12000],
+                    }
+                )
+
+        raise ValueError(
+            "Copilot used too many tool rounds without returning a workflow JSON. "
+            "Try a simpler request or split the task."
+        )
+
+    async def _call_openai_with_tools(
+        self,
+        settings: dict[str, str],
+        messages: list[dict[str, str]],
+        *,
+        temperature: float,
+        max_tokens: int,
+    ) -> dict[str, Any]:
+        from comfy_mcp.tools import COMFYUI_TOOL_DEFINITIONS
+
+        base_url = settings.get("base_url") or "https://api.openai.com/v1"
+        api_key = settings.get("api_key")
+        model = settings.get("model") or "gpt-4o-mini"
+        if not api_key and not _is_local_base_url(base_url):
+            raise ValueError("No LLM API key configured. Add your key in Copilot settings.")
+
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "tools": COMFYUI_TOOL_DEFINITIONS,
+            "tool_choice": "auto",
+        }
+        data = await self._http_json("POST", _join_url(base_url, "chat/completions"), headers=headers, json=payload)
+        try:
+            return data["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ValueError(f"Unexpected LLM response shape: {data}") from exc
+
+    async def _call_anthropic_with_tools(
+        self,
+        settings: dict[str, str],
+        messages: list[dict[str, str]],
+        *,
+        temperature: float,
+        max_tokens: int,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        from comfy_mcp.tools import COMFYUI_TOOL_DEFINITIONS
+
+        base_url = settings.get("base_url") or "https://api.anthropic.com/v1"
+        api_key = settings.get("api_key")
+        model = settings.get("model") or "claude-3-5-sonnet-latest"
+        if not api_key and not _is_local_base_url(base_url):
+            raise ValueError("No Anthropic API key configured. Add your key in Copilot settings.")
+
+        system = "\n\n".join(m["content"] for m in messages if m.get("role") == "system")
+        anthropic_messages = []
+        for message in messages:
+            if message.get("role") == "system":
+                continue
+            role = "assistant" if message.get("role") == "assistant" else "user"
+            anthropic_messages.append({"role": role, "content": message.get("content")})
+
+        headers = {
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01",
+        }
+        if api_key:
+            headers["x-api-key"] = api_key
+        payload = {
+            "model": model,
+            "system": system,
+            "messages": anthropic_messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "tools": [_anthropic_tool_definition(tool) for tool in COMFYUI_TOOL_DEFINITIONS],
+        }
+        data = await self._http_json("POST", _join_url(base_url, "messages"), headers=headers, json=payload)
+        content = data.get("content") or []
+        tool_uses = [block for block in content if isinstance(block, dict) and block.get("type") == "tool_use"]
+        return content, tool_uses
+
     async def _call_openai_compatible(
         self,
         settings: dict[str, str],
@@ -532,15 +693,22 @@ Return ONE JSON object only:
 
 Set workflow_complete to true only when the workflow is fully wired, validates, and matches the user request.
 
+You have MCP tools — call them instead of guessing node schemas:
+- search_nodes(query): find node class_types
+- get_node_info(class_type): required inputs, output slots, types
+- list_model_files(folder): installed checkpoint/lora/vae filenames
+- get_hardware(): VRAM/CPU guidance
+- validate_workflow(workflow_api): check wiring before claiming workflow_complete
+
 Workflow rules:
 - Use ComfyUI API/execution format keyed by string node ids.
-- Use only installed class_type values from installed_nodes (core + custom nodes).
+- Use only class_type values confirmed via search_nodes / get_node_info (core + custom nodes).
 - Every required input must be a literal value or a valid link [source_node_id, output_slot_index] (0-based).
-- Match link types using installed_nodes.outputs slot types and inputs slot types.
+- Match link types using get_node_info output_slots and input types.
 - When editing an existing graph, preserve unrelated nodes: include them in workflow or list removed_node_ids explicitly.
 - Return the nodes you changed plus any nodes they connect to; the server merges into the current graph.
 - Every non-output node must feed an output node (SaveImage, PreviewImage, etc.). No orphan nodes.
-- Prefer installed model filenames from available_models. For missing models, keep filenames and add model_downloads with direct HTTPS URLs.
+- Prefer installed model filenames from list_model_files. For missing models, keep filenames and add model_downloads with direct HTTPS URLs.
 - Respect hardware_context: lower resolution/batch/steps on low VRAM or CPU-only systems.
 - If execution_errors or repair_context.validation are present, fix those issues before claiming completion.
 - run_after_apply: true only when the user clearly wants to run/execute and the workflow should be valid.
@@ -596,25 +764,22 @@ def build_copilot_messages(
             continue
         compact_history.append({"role": role, "content": str(message.get("content", ""))[:900]})
 
-    catalog_limit = 140 if repair_context else 100
-    relevant_nodes = build_relevant_node_catalog(
-        query=prompt,
-        workflow_api=current_workflow,
-        repair_context=repair_context,
-        limit=catalog_limit,
-    )
-
     slim_repair = _slim_repair_context(repair_context) if repair_context else None
+    hardware = build_hardware_context()
     context = trim_context_for_llm(
         {
             "user_request": prompt,
             "current_workflow_api": compact_workflow_api(current_workflow),
             "current_workflow_ui": summarize_ui_workflow(current_ui_workflow),
-            "installed_nodes": relevant_nodes,
-            "available_models": build_model_context(limit_per_folder=10),
-            "hardware_context": build_hardware_context(),
+            "hardware_context": {
+                "cpu_only": hardware.get("cpu_only"),
+                "vram_total_gb": hardware.get("vram_total_gb"),
+                "vram_free_gb": hardware.get("vram_free_gb"),
+                "recommendations": hardware.get("recommendations"),
+            },
             "execution_errors": _slim_execution_errors(execution_errors or [])[:4],
             "repair_context": slim_repair,
+            "note": "Use MCP tools (search_nodes, get_node_info, list_model_files) for node schemas and models.",
         }
     )
     user_content = json.dumps(context, ensure_ascii=False)
@@ -744,6 +909,23 @@ def _slim_execution_errors(errors: list[dict[str, Any]]) -> list[dict[str, Any]]
     return slim
 
 
+def _anthropic_tool_definition(tool: dict[str, Any]) -> dict[str, Any]:
+    function = tool.get("function") or {}
+    return {
+        "name": function.get("name"),
+        "description": function.get("description") or "",
+        "input_schema": function.get("parameters") or {"type": "object", "properties": {}},
+    }
+
+
+def _anthropic_text_from_content(content: list[dict[str, Any]]) -> str:
+    parts = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            parts.append(block.get("text") or "")
+    return "\n".join(parts).strip()
+
+
 def _slim_repair_context(repair_context: dict[str, Any]) -> dict[str, Any]:
     candidate = repair_context.get("candidate") or {}
     workflow = candidate.get("workflow") or candidate.get("workflow_api") or {}
@@ -755,7 +937,6 @@ def _slim_repair_context(repair_context: dict[str, Any]) -> dict[str, Any]:
             "model_downloads": (candidate.get("model_downloads") or [])[:8],
         },
         "validation": repair_context.get("validation"),
-        "connection_hints": (repair_context.get("connection_hints") or [])[:40],
     }
 
 

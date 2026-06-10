@@ -212,6 +212,21 @@ def test_merge_workflow_into_current_honors_removed_node_ids():
     assert "2" in merged
 
 
+def test_build_copilot_messages_omits_bulk_node_catalog(monkeypatch):
+    monkeypatch.setattr(copilot_manager, "build_hardware_context", lambda: {"cpu_only": True, "recommendations": []})
+
+    messages = copilot_manager.build_copilot_messages(
+        prompt="build workflow",
+        history=[],
+        current_workflow={},
+        current_ui_workflow={},
+    )
+    user_message = next(message for message in messages if message["role"] == "user")
+    context = __import__("json").loads(user_message["content"])
+    assert "installed_nodes" not in context
+    assert "available_models" not in context
+
+
 def test_build_copilot_messages_stays_within_context_budget(monkeypatch):
     monkeypatch.setattr(
         nodes,
