@@ -6,6 +6,7 @@ from comfy_mcp import tools
 @pytest.mark.asyncio
 async def test_execute_tool_search_nodes_local(monkeypatch):
   import nodes
+  from app import copilot_manager
 
   class DummyNode:
       RETURN_TYPES = ("IMAGE",)
@@ -19,6 +20,7 @@ async def test_execute_tool_search_nodes_local(monkeypatch):
 
   monkeypatch.setitem(nodes.NODE_CLASS_MAPPINGS, "DummyPreview", DummyNode)
   monkeypatch.setitem(nodes.NODE_DISPLAY_NAME_MAPPINGS, "DummyPreview", "Dummy Preview")
+  monkeypatch.setattr(copilot_manager, "nodes", nodes)
 
   result = await tools.execute_copilot_tool("search_nodes", {"query": "DummyPreview", "limit": 5})
   assert "nodes" in result
@@ -29,6 +31,7 @@ async def test_execute_tool_search_nodes_local(monkeypatch):
 @pytest.mark.asyncio
 async def test_execute_copilot_tool_get_node_info_single(monkeypatch):
   import nodes
+  from app import copilot_manager
 
   class DummyNode:
       RETURN_TYPES = ("IMAGE",)
@@ -42,6 +45,7 @@ async def test_execute_copilot_tool_get_node_info_single(monkeypatch):
 
   monkeypatch.setitem(nodes.NODE_CLASS_MAPPINGS, "DummyPreview", DummyNode)
   monkeypatch.setitem(nodes.NODE_DISPLAY_NAME_MAPPINGS, "DummyPreview", "Dummy Preview")
+  monkeypatch.setattr(copilot_manager, "nodes", nodes)
 
   result = await tools.execute_copilot_tool("get_node_info", {"class_type": "DummyPreview"})
   assert result["node"]["class_type"] == "DummyPreview"

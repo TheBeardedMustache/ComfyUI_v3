@@ -23,7 +23,7 @@ from comfy_api.internal import _ComfyNodeInternal
 
 COPILOT_EXTENSION_NAME = "comfyui-copilot"
 # Bump when Copilot context/MCP behavior changes (visible in /api/copilot/status).
-COPILOT_VERSION = "mcp-tools-v2"
+COPILOT_VERSION = "mcp-tools-v3"
 
 
 class CopilotManager:
@@ -73,12 +73,12 @@ class CopilotManager:
                 current_ui_workflow=body.get("workflow_ui") or {},
                 execution_errors=body.get("execution_errors") or [],
             )
-            from comfy_mcp.tools import COMFYUI_TOOL_DEFINITIONS
+            from comfy_mcp.tools import COPILOT_TOOL_DEFINITIONS
 
             user_content = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
             payload_chars = len(
                 json.dumps(
-                    {"messages": messages, "tools": COMFYUI_TOOL_DEFINITIONS},
+                    {"messages": messages, "tools": COPILOT_TOOL_DEFINITIONS},
                     ensure_ascii=False,
                 )
             )
@@ -495,7 +495,7 @@ class CopilotManager:
         *,
         temperature: float,
         max_tokens: int,
-        max_tool_rounds: int = 6,
+        max_tool_rounds: int = 8,
     ) -> str:
         from comfy_mcp.tools import execute_copilot_tool
 
@@ -505,6 +505,17 @@ class CopilotManager:
         for round_index in range(max_tool_rounds):
             working = trim_messages_for_llm_budget(working)
             _log_llm_payload_size(working, round_index=round_index)
+
+            if round_index >= max_tool_rounds - 2:
+                working.append({"role": "user", "content": COPILOT_FINAL_RESPONSE_NUDGE})
+
+            if round_index >= max_tool_rounds - 1:
+                return await self._call_llm(
+                    settings,
+                    working,
+                    temperature=max(temperature, 0.1),
+                    max_tokens=max_tokens,
+                )
 
             if provider == "anthropic":
                 content, tool_uses = await self._call_anthropic_with_tools(
@@ -557,9 +568,12 @@ class CopilotManager:
                     }
                 )
 
-        raise ValueError(
-            "Copilot used too many tool rounds without returning a workflow JSON. "
-            "Try a simpler request or split the task."
+        working.append({"role": "user", "content": COPILOT_FINAL_RESPONSE_NUDGE})
+        return await self._call_llm(
+            settings,
+            working,
+            temperature=max(temperature, 0.1),
+            max_tokens=max_tokens,
         )
 
     async def _call_openai_with_tools(
@@ -570,7 +584,7 @@ class CopilotManager:
         temperature: float,
         max_tokens: int,
     ) -> dict[str, Any]:
-        from comfy_mcp.tools import COMFYUI_TOOL_DEFINITIONS
+        from comfy_mcp.tools import COPILOT_TOOL_DEFINITIONS
 
         base_url = settings.get("base_url") or "https://api.openai.com/v1"
         api_key = settings.get("api_key")
@@ -587,7 +601,7 @@ class CopilotManager:
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
-            "tools": COMFYUI_TOOL_DEFINITIONS,
+            "tools": COPILOT_TOOL_DEFINITIONS,
             "tool_choice": "auto",
         }
         _guard_llm_payload_size(payload)
@@ -605,7 +619,7 @@ class CopilotManager:
         temperature: float,
         max_tokens: int,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        from comfy_mcp.tools import COMFYUI_TOOL_DEFINITIONS
+        from comfy_mcp.tools import COPILOT_TOOL_DEFINITIONS
 
         base_url = settings.get("base_url") or "https://api.anthropic.com/v1"
         api_key = settings.get("api_key")
@@ -633,7 +647,7 @@ class CopilotManager:
             "messages": anthropic_messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
-            "tools": [_anthropic_tool_definition(tool) for tool in COMFYUI_TOOL_DEFINITIONS],
+            "tools": [_anthropic_tool_definition(tool) for tool in COPILOT_TOOL_DEFINITIONS],
         }
         _guard_llm_payload_size(payload)
         data = await self._http_json("POST", _join_url(base_url, "messages"), headers=headers, json=payload)
@@ -743,12 +757,17 @@ Return ONE JSON object only:
 
 Set workflow_complete to true only when the workflow is fully wired, validates, and matches the user request.
 
-You have MCP tools — call them instead of guessing node schemas:
-- search_nodes(query): find node class_types
-- get_node_info(class_type): required inputs, output slots, types
+You have MCP tools — use them sparingly, then return workflow JSON:
+- search_nodes(query): find class_types (call once if needed)
+- get_node_info(class_type): schema for ONE node you will wire (only for unfamiliar nodes)
 - list_model_files(folder): installed checkpoint/lora/vae filenames
-- get_hardware(): VRAM/CPU guidance
-- validate_workflow(workflow_api): check wiring before claiming workflow_complete
+- get_hardware(): only if you need VRAM guidance for sizing
+
+Tool budget: use at most 3 tool calls total, then you MUST return the workflow JSON object.
+Do NOT call validate_workflow — the server validates automatically after you respond.
+node_hints in the user message already includes schemas for common/core nodes and nodes in the current graph.
+After 1× search_nodes (optional) and get_node_info for any unfamiliar class_type, return the workflow JSON immediately.
+Do not loop on tools. Prefer a partial workflow over endless tool calls.
 
 Workflow rules:
 - Use ComfyUI API/execution format keyed by string node ids.
@@ -763,6 +782,11 @@ Workflow rules:
 - If execution_errors or repair_context.validation are present, fix those issues before claiming completion.
 - run_after_apply: true only when the user clearly wants to run/execute and the workflow should be valid.
 """
+
+COPILOT_FINAL_RESPONSE_NUDGE = (
+    "Stop calling tools. Return ONE JSON object now with assistant_message and workflow. "
+    "The server will validate and repair the graph if needed."
+)
 
 
 # Common nodes included in every Copilot context (keeps simple requests small but useful).
@@ -819,11 +843,13 @@ def build_copilot_messages(
 
     slim_repair = _slim_repair_context(repair_context) if repair_context else None
     hardware = build_hardware_context()
+    node_hints = build_inline_node_hints(current_workflow, prompt=prompt)
     context = trim_context_for_llm(
         {
             "user_request": prompt,
             "current_workflow_api": compact_workflow_api(current_workflow),
             "current_workflow_ui": summarize_ui_workflow(current_ui_workflow),
+            "node_hints": node_hints,
             "hardware_context": {
                 "cpu_only": hardware.get("cpu_only"),
                 "vram_total_gb": hardware.get("vram_total_gb"),
@@ -832,7 +858,7 @@ def build_copilot_messages(
             },
             "execution_errors": _slim_execution_errors(execution_errors or [])[:4],
             "repair_context": slim_repair,
-            "note": "Use MCP tools (search_nodes, get_node_info, list_model_files) for node schemas and models.",
+            "note": "node_hints covers common nodes and the current graph. Use MCP tools only for unfamiliar class_types.",
         }
     )
     user_content = json.dumps(context, ensure_ascii=False)
@@ -847,6 +873,39 @@ def build_copilot_messages(
         *compact_history,
         {"role": "user", "content": user_content},
     ]
+
+
+def build_inline_node_hints(
+    workflow_api: dict[str, Any],
+    *,
+    prompt: str = "",
+    limit: int = 24,
+) -> list[dict[str, Any]]:
+    """Minimal schemas for core nodes, graph nodes, and prompt-matched nodes (not full catalog)."""
+    class_types: list[str] = []
+    seen: set[str] = set()
+    for node in (workflow_api or {}).values():
+        if isinstance(node, dict) and node.get("class_type"):
+            class_type = str(node["class_type"])
+            if class_type not in seen:
+                seen.add(class_type)
+                class_types.append(class_type)
+    for class_type in sorted(ESSENTIAL_NODE_TYPES):
+        if class_type not in seen and class_type in nodes.NODE_CLASS_MAPPINGS:
+            seen.add(class_type)
+            class_types.append(class_type)
+    if prompt.strip():
+        for hit in search_node_class_types(query=prompt, limit=12):
+            class_type = hit["class_type"]
+            if class_type not in seen and class_type in nodes.NODE_CLASS_MAPPINGS:
+                seen.add(class_type)
+                class_types.append(class_type)
+    hints: list[dict[str, Any]] = []
+    for class_type in class_types[:limit]:
+        entry = get_node_info_entry(class_type)
+        if entry:
+            hints.append(entry)
+    return hints
 
 
 def build_relevant_node_catalog(
@@ -1511,6 +1570,22 @@ def _model_destination_path(folder: str, filename: str) -> str:
     return destination
 
 
+def _node_search_haystack(class_type: str, display_name: str, category: str) -> str:
+    camel_spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", class_type)
+    underscored = class_type.replace("_", " ")
+    return f"{class_type} {display_name} {category} {camel_spaced} {underscored}".lower()
+
+
+def _expand_search_terms(query: str) -> list[str]:
+    terms = [term.lower() for term in re.findall(r"[a-zA-Z0-9_./-]+", query or "") if len(term) > 2]
+    lowered = query.lower()
+    if "image" in terms and "video" in terms:
+        terms.extend(["imagetovideo", "image2video", "i2v"])
+    if "wan" in terms or "wan" in lowered:
+        terms.append("wan")
+    return list(dict.fromkeys(terms))
+
+
 def search_node_class_types(
     *,
     query: str = "",
@@ -1518,14 +1593,14 @@ def search_node_class_types(
     limit: int = 15,
 ) -> list[dict[str, Any]]:
     """Lightweight node search — names/categories only, no INPUT_TYPES scan."""
-    terms = [term.lower() for term in re.findall(r"[a-zA-Z0-9_./-]+", query or "") if len(term) > 2]
+    terms = _expand_search_terms(query)
     pinned = pinned or set()
     scored: list[tuple[int, str]] = []
 
     for class_type in nodes.NODE_CLASS_MAPPINGS:
         display_name = nodes.NODE_DISPLAY_NAME_MAPPINGS.get(class_type, class_type)
         category = str(getattr(nodes.NODE_CLASS_MAPPINGS[class_type], "CATEGORY", ""))[:80]
-        haystack = f"{class_type} {display_name} {category}".lower()
+        haystack = _node_search_haystack(class_type, display_name, category)
         score = sum(1 for term in terms if term in haystack) if terms else 0
         if class_type in pinned:
             score += 1000

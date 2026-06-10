@@ -34,6 +34,10 @@ sys.modules["comfy_api.internal"] = comfy_api_internal
 
 from app import copilot_manager
 
+copilot_manager.nodes = nodes
+copilot_manager.folder_paths = folder_paths
+copilot_manager.execution = execution
+
 
 class DummyLoader:
     RETURN_TYPES = ("IMAGE",)
@@ -274,6 +278,17 @@ def test_build_relevant_node_catalog_prioritizes_workflow_nodes(monkeypatch):
 
     class_types = {entry["class_type"] for entry in catalog}
     assert "DummyCheckpointLoader" in class_types
+
+
+def test_search_node_class_types_matches_camel_case_names(monkeypatch):
+    class WanImageToVideoNode:
+        CATEGORY = "conditioning/video_models"
+
+    monkeypatch.setitem(nodes.NODE_CLASS_MAPPINGS, "WanImageToVideo", WanImageToVideoNode)
+    monkeypatch.setitem(nodes.NODE_DISPLAY_NAME_MAPPINGS, "WanImageToVideo", "Wan Image To Video")
+
+    hits = copilot_manager.search_node_class_types(query="wan image to video", limit=5)
+    assert any(hit["class_type"] == "WanImageToVideo" for hit in hits)
 
 
 def test_get_node_info_entry_returns_single_node(monkeypatch):

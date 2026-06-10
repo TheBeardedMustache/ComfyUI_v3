@@ -88,6 +88,11 @@ COMFYUI_TOOL_DEFINITIONS: list[dict[str, Any]] = [
 ]
 
 
+COPILOT_TOOL_DEFINITIONS: list[dict[str, Any]] = [
+    tool for tool in COMFYUI_TOOL_DEFINITIONS if tool.get("function", {}).get("name") != "validate_workflow"
+]
+
+
 def _use_http() -> bool:
     return os.environ.get("COMFY_MCP_USE_HTTP", "0").lower() in {"1", "true", "yes"}
 

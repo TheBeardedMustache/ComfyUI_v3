@@ -38,6 +38,11 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from app.copilot_manager import COPILOT_VERSION, CopilotManager
 
+CopilotManager  # re-export for tests
+import app.copilot_manager as copilot_manager_module
+
+copilot_manager_module.nodes = nodes
+
 
 @pytest.mark.asyncio
 async def test_copilot_chat_llm_payload_stays_small():
@@ -89,6 +94,99 @@ async def test_copilot_chat_llm_payload_stays_small():
             assert size < 50_000, f"LLM payload too large: {size} chars"
             user_blob = next(m["content"] for m in payload["messages"] if m["role"] == "user")
             assert "installed_nodes" not in user_blob
+
+
+@pytest.mark.asyncio
+async def test_copilot_agent_finishes_after_repeated_tool_calls():
+    """Simulates a model that keeps calling tools; Copilot must still return JSON."""
+    tool_calls = {"count": 0}
+    captured: dict = {}
+
+    async def fake_http_json(self, method, url, **kwargs):
+        payload = kwargs.get("json") or {}
+        if method == "POST" and "chat/completions" in url:
+            if payload.get("tools"):
+                tool_calls["count"] += 1
+                if tool_calls["count"] <= 12:
+                    return {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": None,
+                                    "tool_calls": [
+                                        {
+                                            "id": f"call-{tool_calls['count']}",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "search_nodes",
+                                                "arguments": json.dumps({"query": "WanImageToVideo"}),
+                                            },
+                                        }
+                                    ],
+                                }
+                            }
+                        ]
+                    }
+            captured["final_payload"] = payload
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "assistant_message": "WAN image-to-video workflow",
+                                    "workflow": {
+                                        "1": {"class_type": "LoadImage", "inputs": {"image": "input.png"}},
+                                        "2": {
+                                            "class_type": "WanImageToVideo",
+                                            "inputs": {
+                                                "positive": ["3", 0],
+                                                "negative": ["4", 0],
+                                                "vae": ["5", 0],
+                                                "width": 832,
+                                                "height": 480,
+                                                "length": 81,
+                                                "batch_size": 1,
+                                                "start_image": ["1", 0],
+                                            },
+                                        },
+                                    },
+                                    "workflow_complete": False,
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+        raise AssertionError(f"unexpected HTTP {method} {url}")
+
+    app = web.Application()
+    routes = web.RouteTableDef()
+    manager = CopilotManager(prompt_server=None)
+    manager.add_routes(routes)
+    app.add_routes(routes)
+
+    async with TestClient(TestServer(app)) as client:
+        with patch.object(CopilotManager, "_http_json", fake_http_json):
+            resp = await client.post(
+                "/copilot/chat",
+                json={
+                    "prompt": (
+                        "Create a WAN 2.1 image to video workflow using WanImageToVideo, "
+                        "LoadImage, and SaveVideo."
+                    ),
+                    "workflow_api": {},
+                    "workflow_ui": {},
+                    "messages": [],
+                    "api_key": "test-key",
+                    "model": "gpt-4o-mini",
+                },
+            )
+            body = await resp.text()
+            assert '"type": "error"' not in body, body
+            assert "too many tool rounds" not in body
+            assert tool_calls["count"] >= 1
+            assert captured.get("final_payload") is not None
 
 
 @pytest.mark.asyncio
