@@ -48,7 +48,7 @@ Replace `cwd` with your ComfyUI checkout path.
 | Tool | Description |
 |------|-------------|
 | `search_nodes` | Search installed nodes by keyword |
-| `get_node_info` | Full input/output schema for one `class_type` |
+| `get_node_info` | Input/output schema for a single `class_type` |
 | `list_model_files` | List files in a models folder |
 | `get_hardware` | GPU/VRAM/CPU stats and recommendations |
 | `validate_workflow` | Validate API workflow wiring |

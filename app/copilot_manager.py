@@ -22,6 +22,8 @@ from comfy_api.internal import _ComfyNodeInternal
 
 
 COPILOT_EXTENSION_NAME = "comfyui-copilot"
+# Bump when Copilot context/MCP behavior changes (visible in /api/copilot/status).
+COPILOT_VERSION = "mcp-tools-v2"
 
 
 class CopilotManager:
@@ -44,6 +46,7 @@ class CopilotManager:
                     "enabled": True,
                     "local": True,
                     "hosted_backend": False,
+                    "copilot_version": COPILOT_VERSION,
                     "extension": COPILOT_EXTENSION_NAME,
                     "routes": [
                         "/api/copilot/chat",
@@ -54,7 +57,41 @@ class CopilotManager:
                         "/api/copilot/models",
                         "/api/copilot/hardware",
                         "/api/copilot/mcp",
+                        "/api/copilot/context_preview",
                     ],
+                }
+            )
+
+        @routes.post("/copilot/context_preview")
+        async def context_preview(request):
+            """Return LLM context size stats without calling the LLM (for debugging)."""
+            body = await _read_json(request)
+            messages = build_copilot_messages(
+                prompt=(body.get("prompt") or "preview").strip(),
+                history=body.get("messages") or [],
+                current_workflow=body.get("workflow_api") or body.get("prompt_workflow") or {},
+                current_ui_workflow=body.get("workflow_ui") or {},
+                execution_errors=body.get("execution_errors") or [],
+            )
+            from comfy_mcp.tools import COMFYUI_TOOL_DEFINITIONS
+
+            user_content = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
+            payload_chars = len(
+                json.dumps(
+                    {"messages": messages, "tools": COMFYUI_TOOL_DEFINITIONS},
+                    ensure_ascii=False,
+                )
+            )
+            return web.json_response(
+                {
+                    "copilot_version": COPILOT_VERSION,
+                    "node_class_count": len(nodes.NODE_CLASS_MAPPINGS),
+                    "message_count": len(messages),
+                    "message_chars": estimate_messages_char_size(messages),
+                    "payload_chars_with_tools": payload_chars,
+                    "estimated_tokens": payload_chars // 4,
+                    "bulk_node_catalog_in_context": '"installed_nodes"' in str(user_content),
+                    "uses_mcp_tools": True,
                 }
             )
 
@@ -544,6 +581,7 @@ class CopilotManager:
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
+        messages = trim_messages_for_llm_budget(messages)
         payload = {
             "model": model,
             "messages": messages,
@@ -552,6 +590,7 @@ class CopilotManager:
             "tools": COMFYUI_TOOL_DEFINITIONS,
             "tool_choice": "auto",
         }
+        _guard_llm_payload_size(payload)
         data = await self._http_json("POST", _join_url(base_url, "chat/completions"), headers=headers, json=payload)
         try:
             return data["choices"][0]["message"]
@@ -574,20 +613,20 @@ class CopilotManager:
         if not api_key and not _is_local_base_url(base_url):
             raise ValueError("No Anthropic API key configured. Add your key in Copilot settings.")
 
-        system = "\n\n".join(m["content"] for m in messages if m.get("role") == "system")
-        anthropic_messages = []
-        for message in messages:
-            if message.get("role") == "system":
-                continue
-            role = "assistant" if message.get("role") == "assistant" else "user"
-            anthropic_messages.append({"role": role, "content": message.get("content")})
-
         headers = {
             "Content-Type": "application/json",
             "anthropic-version": "2023-06-01",
         }
         if api_key:
             headers["x-api-key"] = api_key
+        trimmed = trim_messages_for_llm_budget(messages)
+        system = "\n\n".join(m["content"] for m in trimmed if m.get("role") == "system")
+        anthropic_messages = []
+        for message in trimmed:
+            if message.get("role") == "system":
+                continue
+            role = "assistant" if message.get("role") == "assistant" else "user"
+            anthropic_messages.append({"role": role, "content": message.get("content")})
         payload = {
             "model": model,
             "system": system,
@@ -596,6 +635,7 @@ class CopilotManager:
             "max_tokens": max_tokens,
             "tools": [_anthropic_tool_definition(tool) for tool in COMFYUI_TOOL_DEFINITIONS],
         }
+        _guard_llm_payload_size(payload)
         data = await self._http_json("POST", _join_url(base_url, "messages"), headers=headers, json=payload)
         content = data.get("content") or []
         tool_uses = [block for block in content if isinstance(block, dict) and block.get("type") == "tool_use"]
@@ -1619,6 +1659,21 @@ def trim_messages_for_llm_budget(
             "Clear chat history, simplify the graph, or use a model with a larger context window."
         )
     return trimmed
+
+
+def _guard_llm_payload_size(payload: dict[str, Any]) -> None:
+    size = len(json.dumps(payload, ensure_ascii=False, default=str))
+    if size <= LLM_MESSAGE_CHAR_BUDGET:
+        return
+    if '"installed_nodes"' in json.dumps(payload, ensure_ascii=False):
+        raise ValueError(
+            f"Copilot {COPILOT_VERSION} detected a legacy bulk node catalog in LLM context "
+            f"({size} chars). Restart ComfyUI after updating to the latest Copilot build."
+        )
+    raise ValueError(
+        f"Copilot context is too large for the selected model ({size} chars, ~{size // 4} tokens). "
+        "Clear chat history, simplify the graph, or use a model with a larger context window."
+    )
 
 
 def _log_llm_payload_size(messages: list[dict[str, Any]], *, round_index: int) -> None:
