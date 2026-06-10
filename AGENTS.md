@@ -63,7 +63,8 @@ Inference tests (`tests/inference`) require SDXL checkpoint files in `models/che
 - Single agent with server-side validation/repair loop; edits merge into the current graph (positions preserved for existing nodes)
 - **MCP tools** (`comfy_mcp/`): Copilot calls `search_nodes`, `get_node_info`, etc. on demand — node catalogs are not dumped into LLM context
 - MCP stdio server: `pip install -r mcp_requirements.txt` then `python3 -m comfy_mcp` (see `doc/MCP-SETUP.md`)
-- Copilot unit tests: run `tests-unit/app_test/copilot_manager_test.py` in isolation (it mocks `sys.modules` at import time)
+- Recipe scaffolds (`app/copilot_recipes.py`) auto-complete partial graphs (e.g. 2-node WAN i2v stubs → full 11-node pipeline). Check `copilot_version` via `GET /api/copilot/status` (currently `mcp-tools-v4`).
+- Copilot unit tests: `python3 -m pytest tests-unit/app_test/copilot_* tests-unit/comfy_mcp_test/tools_test.py -v`
 
 ### Gotchas
 
