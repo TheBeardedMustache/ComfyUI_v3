@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import socket
+import sys
 import time
 import urllib.parse
 import uuid
@@ -51,17 +52,42 @@ class CopilotManager:
                         "/api/copilot/download_models",
                         "/api/copilot/node_catalog",
                         "/api/copilot/models",
+                        "/api/copilot/hardware",
+                        "/api/copilot/mcp",
                     ],
                 }
             )
 
         @routes.get("/copilot/node_catalog")
         async def node_catalog(request):
+            class_type = (request.rel_url.query.get("class_type") or "").strip()
+            if class_type:
+                entry = get_node_info_entry(class_type)
+                nodes_list = [entry] if entry else []
+                return web.json_response({"nodes": nodes_list, "total": len(nodes_list)})
+
             query = request.rel_url.query.get("q", "")
-            limit = _parse_int(request.rel_url.query.get("limit"), 200)
-            full = request.rel_url.query.get("full", "false").lower() == "true"
-            catalog = build_node_catalog(query=query, limit=None if full else limit)
+            limit = _parse_int(request.rel_url.query.get("limit"), 50)
+            limit = max(1, min(limit, 100))
+            detailed = request.rel_url.query.get("full", "false").lower() == "true"
+            catalog = build_node_catalog(query=query, limit=limit, detailed=detailed)
             return web.json_response({"nodes": catalog, "total": len(catalog)})
+
+        @routes.get("/copilot/hardware")
+        async def hardware(request):
+            return web.json_response(build_hardware_context())
+
+        @routes.get("/copilot/mcp")
+        async def mcp_info(request):
+            from comfy_mcp.tools import COMFYUI_TOOL_DEFINITIONS
+
+            return web.json_response(
+                {
+                    "stdio_command": "python3 -m comfy_mcp",
+                    "env": {"COMFYUI_HOST": "http://127.0.0.1:8188", "COMFY_MCP_USE_HTTP": "1"},
+                    "tools": [tool["function"]["name"] for tool in COMFYUI_TOOL_DEFINITIONS],
+                }
+            )
 
         @routes.get("/copilot/models")
         async def models(request):
@@ -140,7 +166,7 @@ class CopilotManager:
                 await response.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
 
             try:
-                await emit("status", text="Reading current workflow and installed node catalog.")
+                await emit("status", text="Reading the current workflow.")
                 settings = _llm_settings_from_request(request, body)
                 prompt = (body.get("prompt") or "").strip()
                 if not prompt:
@@ -157,6 +183,7 @@ class CopilotManager:
                     history=history,
                     current_workflow=current_workflow,
                     current_ui_workflow=current_ui_workflow,
+                    execution_errors=body.get("execution_errors") or [],
                 )
 
                 max_attempts = _parse_int(body.get("max_repair_iterations"), 5)
@@ -167,16 +194,18 @@ class CopilotManager:
                     if not isinstance(workflow_api, dict):
                         raise ValueError("LLM did not return a ComfyUI API-format workflow object.")
 
+                    workflow_api = merge_workflow_into_current(current_workflow, candidate)
+                    candidate["workflow"] = workflow_api
                     missing_models = collect_missing_models(workflow_api, candidate)
                     validation = await self._validate_workflow(workflow_api, strict_topology=True)
                     validation["missing_models"] = missing_models
-                    if validation["success"]:
+                    if validation["success"] and not missing_models:
                         await emit("status", text=f"Workflow validation passed after {attempt} attempt(s).")
                         break
-                    if missing_models:
+                    if validation["success"] and missing_models:
                         await emit(
                             "status",
-                            text="Workflow needs missing models before validation can complete.",
+                            text="Graph wiring is valid but required model files are missing.",
                             missing_models=missing_models,
                         )
                         break
@@ -184,21 +213,41 @@ class CopilotManager:
                     await emit(
                         "status",
                         text=f"Validation found issues; repair pass {attempt} of {max_attempts}.",
-                        validation=validation,
+                        validation=summarize_validation_for_client(validation),
                     )
                     if attempt == max_attempts:
                         break
                     candidate = await self._repair_workflow_edit(
                         settings=settings,
                         prompt=prompt,
+                        history=history,
+                        current_workflow=current_workflow,
+                        current_ui_workflow=current_ui_workflow,
                         candidate=candidate,
                         validation=validation,
+                        execution_errors=body.get("execution_errors") or [],
                     )
 
-                final_workflow = candidate.get("workflow") or candidate.get("workflow_api") or {}
+                final_workflow = merge_workflow_into_current(
+                    current_workflow,
+                    {
+                        **candidate,
+                        "workflow": candidate.get("workflow") or candidate.get("workflow_api") or {},
+                    },
+                )
                 message = candidate.get("assistant_message") or candidate.get("message") or ""
+                if not validation["success"]:
+                    issue_summary = summarize_validation_for_client(validation)
+                    message = (
+                        f"{message}\n\nThe workflow is not complete yet. "
+                        f"Issues: {json.dumps(issue_summary, ensure_ascii=False)[:2500]}"
+                    ).strip()
+                elif missing_models:
+                    message = (
+                        f"{message}\n\nModel files are still missing; approve downloads to run this workflow."
+                    ).strip()
 
-                execute_after_apply = bool(body.get("execute"))
+                execute_after_apply = bool(body.get("execute") or candidate.get("run_after_apply"))
                 execution_result = None
                 if missing_models:
                     await emit(
@@ -233,14 +282,18 @@ class CopilotManager:
         history: list[dict[str, Any]],
         current_workflow: dict[str, Any],
         current_ui_workflow: dict[str, Any],
+        execution_errors: list[dict[str, Any]],
     ) -> dict[str, Any]:
         messages = build_copilot_messages(
             prompt=prompt,
             history=history,
             current_workflow=current_workflow,
             current_ui_workflow=current_ui_workflow,
+            execution_errors=execution_errors,
         )
-        text = await self._call_llm(settings, messages, temperature=0.15, max_tokens=12000)
+        text = await self._call_llm_agent_with_tools(
+            settings, messages, temperature=0.15, max_tokens=16000
+        )
         return _extract_json_object(text)
 
     async def _repair_workflow_edit(
@@ -248,26 +301,27 @@ class CopilotManager:
         *,
         settings: dict[str, str],
         prompt: str,
+        history: list[dict[str, Any]],
+        current_workflow: dict[str, Any],
+        current_ui_workflow: dict[str, Any],
         candidate: dict[str, Any],
         validation: dict[str, Any],
+        execution_errors: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        messages = [
-            {"role": "system", "content": COPILOT_REPAIR_PROMPT},
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "original_request": prompt,
-                        "candidate": candidate,
-                        "validation": validation,
-                        "installed_nodes": build_node_catalog(limit=700),
-                        "available_models": build_model_context(),
-                    },
-                    ensure_ascii=False,
-                ),
+        messages = build_copilot_messages(
+            prompt=prompt,
+            history=history,
+            current_workflow=current_workflow,
+            current_ui_workflow=current_ui_workflow,
+            execution_errors=execution_errors,
+            repair_context={
+                "candidate": candidate,
+                "validation": summarize_validation_for_llm(validation),
             },
-        ]
-        text = await self._call_llm(settings, messages, temperature=0.05, max_tokens=12000)
+        )
+        text = await self._call_llm_agent_with_tools(
+            settings, messages, temperature=0.05, max_tokens=16000
+        )
         return _extract_json_object(text)
 
     async def _validate_workflow(self, workflow_api: dict[str, Any], *, strict_topology: bool) -> dict[str, Any]:
@@ -277,13 +331,15 @@ class CopilotManager:
         prompt_id = f"copilot-validate-{uuid.uuid4().hex}"
         valid = await execution.validate_prompt(prompt_id, workflow_api, None)
         topology = lint_workflow_topology(workflow_api)
-        success = bool(valid[0]) and (not strict_topology or not topology)
+        connection_issues = lint_workflow_connections(workflow_api)
+        success = bool(valid[0]) and (not strict_topology or not topology) and not connection_issues
         return {
             "success": success,
             "error": None if bool(valid[0]) else valid[1],
             "node_errors": valid[3],
             "output_nodes": valid[2] if bool(valid[0]) else [],
             "topology_warnings": topology,
+            "connection_issues": connection_issues,
         }
 
     async def _queue_prompt(self, workflow_api: dict[str, Any], *, client_id: str | None) -> dict[str, Any]:
@@ -395,6 +451,156 @@ class CopilotManager:
             settings, messages, temperature=temperature, max_tokens=max_tokens
         )
 
+    async def _call_llm_agent_with_tools(
+        self,
+        settings: dict[str, str],
+        messages: list[dict[str, str]],
+        *,
+        temperature: float,
+        max_tokens: int,
+        max_tool_rounds: int = 6,
+    ) -> str:
+        from comfy_mcp.tools import execute_copilot_tool
+
+        working = list(messages)
+        provider = settings.get("provider", "openai")
+
+        for round_index in range(max_tool_rounds):
+            working = trim_messages_for_llm_budget(working)
+            _log_llm_payload_size(working, round_index=round_index)
+
+            if provider == "anthropic":
+                content, tool_uses = await self._call_anthropic_with_tools(
+                    settings, working, temperature=temperature, max_tokens=max_tokens
+                )
+                if not tool_uses:
+                    text = _anthropic_text_from_content(content)
+                    if not text:
+                        raise ValueError("LLM returned an empty response.")
+                    return text
+
+                working.append({"role": "assistant", "content": content})
+                tool_results = []
+                for tool_use in tool_uses:
+                    result = await execute_copilot_tool(tool_use["name"], tool_use.get("input") or {})
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use["id"],
+                            "content": serialize_tool_result_for_llm(result),
+                        }
+                    )
+                working.append({"role": "user", "content": tool_results})
+                continue
+
+            message = await self._call_openai_with_tools(
+                settings, working, temperature=temperature, max_tokens=max_tokens
+            )
+            tool_calls = message.get("tool_calls") or []
+            if not tool_calls:
+                text = message.get("content") or ""
+                if not text:
+                    raise ValueError("LLM returned an empty response.")
+                return text
+
+            working.append(message)
+            for tool_call in tool_calls:
+                function = tool_call.get("function") or {}
+                name = function.get("name") or ""
+                try:
+                    arguments = json.loads(function.get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    arguments = {}
+                result = await execute_copilot_tool(name, arguments)
+                working.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.get("id"),
+                        "content": serialize_tool_result_for_llm(result),
+                    }
+                )
+
+        raise ValueError(
+            "Copilot used too many tool rounds without returning a workflow JSON. "
+            "Try a simpler request or split the task."
+        )
+
+    async def _call_openai_with_tools(
+        self,
+        settings: dict[str, str],
+        messages: list[dict[str, str]],
+        *,
+        temperature: float,
+        max_tokens: int,
+    ) -> dict[str, Any]:
+        from comfy_mcp.tools import COMFYUI_TOOL_DEFINITIONS
+
+        base_url = settings.get("base_url") or "https://api.openai.com/v1"
+        api_key = settings.get("api_key")
+        model = settings.get("model") or "gpt-4o-mini"
+        if not api_key and not _is_local_base_url(base_url):
+            raise ValueError("No LLM API key configured. Add your key in Copilot settings.")
+
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "tools": COMFYUI_TOOL_DEFINITIONS,
+            "tool_choice": "auto",
+        }
+        data = await self._http_json("POST", _join_url(base_url, "chat/completions"), headers=headers, json=payload)
+        try:
+            return data["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ValueError(f"Unexpected LLM response shape: {data}") from exc
+
+    async def _call_anthropic_with_tools(
+        self,
+        settings: dict[str, str],
+        messages: list[dict[str, str]],
+        *,
+        temperature: float,
+        max_tokens: int,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        from comfy_mcp.tools import COMFYUI_TOOL_DEFINITIONS
+
+        base_url = settings.get("base_url") or "https://api.anthropic.com/v1"
+        api_key = settings.get("api_key")
+        model = settings.get("model") or "claude-3-5-sonnet-latest"
+        if not api_key and not _is_local_base_url(base_url):
+            raise ValueError("No Anthropic API key configured. Add your key in Copilot settings.")
+
+        system = "\n\n".join(m["content"] for m in messages if m.get("role") == "system")
+        anthropic_messages = []
+        for message in messages:
+            if message.get("role") == "system":
+                continue
+            role = "assistant" if message.get("role") == "assistant" else "user"
+            anthropic_messages.append({"role": role, "content": message.get("content")})
+
+        headers = {
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01",
+        }
+        if api_key:
+            headers["x-api-key"] = api_key
+        payload = {
+            "model": model,
+            "system": system,
+            "messages": anthropic_messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "tools": [_anthropic_tool_definition(tool) for tool in COMFYUI_TOOL_DEFINITIONS],
+        }
+        data = await self._http_json("POST", _join_url(base_url, "messages"), headers=headers, json=payload)
+        content = data.get("content") or []
+        tool_uses = [block for block in content if isinstance(block, dict) and block.get("type") == "tool_use"]
+        return content, tool_uses
+
     async def _call_openai_compatible(
         self,
         settings: dict[str, str],
@@ -472,14 +678,15 @@ class CopilotManager:
             return await _request_json(temp_session, method, url, **kwargs)
 
 
-COPILOT_SYSTEM_PROMPT = """You are ComfyUI Copilot running locally inside ComfyUI.
+COPILOT_SYSTEM_PROMPT = """You are ComfyUI Copilot — the single local agent for ComfyUI.
 
-Your job is to edit the workflow currently open in the user's graph. Do not create a new tab, do not tell the user to paste JSON manually, and do not leave partial fixes.
+You edit the workflow currently open in the user's graph. Never open a new workflow tab, never tell the user to paste JSON manually, and never claim the graph is complete until every required input is wired and every link type matches.
 
 Return ONE JSON object only:
 {
-  "assistant_message": "short explanation of the edit",
-  "workflow": { "...": { "class_type": "...", "inputs": { ... } } },
+  "assistant_message": "concise explanation; if issues remain, list them explicitly",
+  "workflow": { "node_id": { "class_type": "...", "inputs": { ... } } },
+  "removed_node_ids": ["optional node ids to delete from the current graph"],
   "model_downloads": [
     {
       "folder": "checkpoints",
@@ -490,26 +697,66 @@ Return ONE JSON object only:
       "reason": "why this model is needed"
     }
   ],
-  "run_after_apply": false
+  "run_after_apply": false,
+  "workflow_complete": false
 }
 
+Set workflow_complete to true only when the workflow is fully wired, validates, and matches the user request.
+
+You have MCP tools — call them instead of guessing node schemas:
+- search_nodes(query): find node class_types
+- get_node_info(class_type): required inputs, output slots, types
+- list_model_files(folder): installed checkpoint/lora/vae filenames
+- get_hardware(): VRAM/CPU guidance
+- validate_workflow(workflow_api): check wiring before claiming workflow_complete
+
 Workflow rules:
-- The workflow value must be ComfyUI API/execution format, keyed by string node ids.
-- Use only installed node class_type values from installed_nodes, including custom nodes.
-- Satisfy every required input with either a literal value or a valid [node_id, output_index] link.
-- Preserve and modify the current workflow when one is provided. Generate from scratch only when the current graph is empty.
-- Do not leave orphan nodes: every non-output node should contribute to a PreviewImage, SaveImage, or another output node.
-- Prefer available local model filenames. If a required model is not installed and the user request needs it, keep the intended filename in the workflow and add a model_downloads entry with a direct HTTPS download URL, target folder, and reason.
-- Only include model_downloads for models used by the returned workflow. Do not include API keys or signed private URLs.
-- Keep the graph focused, runnable, and minimal.
-- The frontend will apply the returned API workflow to the currently visible graph and lay it out, so do not include UI-only node positions.
+- Use ComfyUI API/execution format keyed by string node ids.
+- Use only class_type values confirmed via search_nodes / get_node_info (core + custom nodes).
+- Every required input must be a literal value or a valid link [source_node_id, output_slot_index] (0-based).
+- Match link types using get_node_info output_slots and input types.
+- When editing an existing graph, preserve unrelated nodes: include them in workflow or list removed_node_ids explicitly.
+- Return the nodes you changed plus any nodes they connect to; the server merges into the current graph.
+- Every non-output node must feed an output node (SaveImage, PreviewImage, etc.). No orphan nodes.
+- Prefer installed model filenames from list_model_files. For missing models, keep filenames and add model_downloads with direct HTTPS URLs.
+- Respect hardware_context: lower resolution/batch/steps on low VRAM or CPU-only systems.
+- If execution_errors or repair_context.validation are present, fix those issues before claiming completion.
+- run_after_apply: true only when the user clearly wants to run/execute and the workflow should be valid.
 """
 
 
-COPILOT_REPAIR_PROMPT = """You repair invalid ComfyUI API workflows.
+# Common nodes included in every Copilot context (keeps simple requests small but useful).
+ESSENTIAL_NODE_TYPES = frozenset(
+    {
+        "CheckpointLoaderSimple",
+        "CheckpointLoader",
+        "KSampler",
+        "KSamplerAdvanced",
+        "EmptyLatentImage",
+        "VAEDecode",
+        "VAEEncode",
+        "VAELoader",
+        "SaveImage",
+        "PreviewImage",
+        "CLIPTextEncode",
+        "CLIPLoader",
+        "LoraLoader",
+        "LoraLoaderModelOnly",
+        "UNETLoader",
+        "DualCLIPLoader",
+        "LoadImage",
+        "ImageScale",
+        "ControlNetLoader",
+        "ControlNetApply",
+        "ControlNetApplyAdvanced",
+    }
+)
 
-Return ONE JSON object only with assistant_message, workflow, and model_downloads if the workflow intentionally uses missing model files. Use installed node metadata, fix every validation error that is not resolved by downloading a declared model, remove orphan nodes, preserve the user's requested behavior, and do not invent uninstalled class_type values.
-"""
+# Rough character budget for the JSON user payload (~20-25k tokens with headroom under 128k total).
+COPILOT_CONTEXT_CHAR_BUDGET = 60_000
+# Hard cap on serialized chat messages sent to the LLM (~100k tokens under a 128k model limit).
+LLM_MESSAGE_CHAR_BUDGET = 360_000
+TOOL_RESULT_CHAR_LIMIT = 3_500
 
 
 def build_copilot_messages(
@@ -518,49 +765,479 @@ def build_copilot_messages(
     history: list[dict[str, Any]],
     current_workflow: dict[str, Any],
     current_ui_workflow: dict[str, Any],
+    execution_errors: list[dict[str, Any]] | None = None,
+    repair_context: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
     compact_history = []
-    for message in history[-8:]:
+    for message in history[-4:]:
         role = message.get("role", "user")
         if role in {"ai", "assistant"}:
             role = "assistant"
         elif role != "user":
             continue
-        compact_history.append({"role": role, "content": str(message.get("content", ""))[:2000]})
+        compact_history.append({"role": role, "content": str(message.get("content", ""))[:600]})
 
-    context = {
-        "user_request": prompt,
-        "current_workflow_api": current_workflow,
-        "current_workflow_ui_summary": summarize_ui_workflow(current_ui_workflow),
-        "installed_nodes": build_node_catalog(query=prompt, limit=900),
-        "available_models": build_model_context(),
-    }
+    slim_repair = _slim_repair_context(repair_context) if repair_context else None
+    hardware = build_hardware_context()
+    context = trim_context_for_llm(
+        {
+            "user_request": prompt,
+            "current_workflow_api": compact_workflow_api(current_workflow),
+            "current_workflow_ui": summarize_ui_workflow(current_ui_workflow),
+            "hardware_context": {
+                "cpu_only": hardware.get("cpu_only"),
+                "vram_total_gb": hardware.get("vram_total_gb"),
+                "vram_free_gb": hardware.get("vram_free_gb"),
+                "recommendations": hardware.get("recommendations"),
+            },
+            "execution_errors": _slim_execution_errors(execution_errors or [])[:4],
+            "repair_context": slim_repair,
+            "note": "Use MCP tools (search_nodes, get_node_info, list_model_files) for node schemas and models.",
+        }
+    )
+    user_content = json.dumps(context, ensure_ascii=False)
+    if repair_context:
+        user_content = (
+            "Repair the candidate workflow. Fix every validation and connection issue. "
+            "Do not claim workflow_complete until the graph is fully wired.\n"
+            + user_content
+        )
     return [
         {"role": "system", "content": COPILOT_SYSTEM_PROMPT},
         *compact_history,
-        {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
+        {"role": "user", "content": user_content},
     ]
 
 
-def summarize_ui_workflow(workflow_ui: dict[str, Any]) -> dict[str, Any]:
-    nodes_ui = workflow_ui.get("nodes") if isinstance(workflow_ui, dict) else None
-    if not isinstance(nodes_ui, list):
-        return {}
+def build_relevant_node_catalog(
+    *,
+    query: str,
+    workflow_api: dict[str, Any],
+    repair_context: dict[str, Any] | None = None,
+    limit: int = 100,
+    hydrate_schemas: bool = True,
+) -> list[dict[str, Any]]:
+    pinned: set[str] = set(ESSENTIAL_NODE_TYPES)
+    for node in (workflow_api or {}).values():
+        if isinstance(node, dict) and node.get("class_type"):
+            pinned.add(str(node["class_type"]))
+
+    if repair_context:
+        candidate = repair_context.get("candidate") or {}
+        workflow = candidate.get("workflow") or candidate.get("workflow_api") or {}
+        for node in workflow.values():
+            if isinstance(node, dict) and node.get("class_type"):
+                pinned.add(str(node["class_type"]))
+        for hint in repair_context.get("connection_hints") or []:
+            if isinstance(hint, dict) and hint.get("class_type"):
+                pinned.add(str(hint["class_type"]))
+
+    hits = search_node_class_types(query=query, pinned=pinned, limit=limit)
+    if not hydrate_schemas:
+        return hits
+
+    catalog: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for hit in hits:
+        class_type = hit["class_type"]
+        if class_type in seen:
+            continue
+        seen.add(class_type)
+        entry = get_node_info_entry(class_type)
+        if entry:
+            catalog.append(entry)
+    return catalog[:limit]
+
+
+def _minimal_catalog_entry(class_type: str, info: dict[str, Any]) -> dict[str, Any]:
     return {
-        "node_count": len(nodes_ui),
-        "nodes": [
+        "class_type": class_type,
+        "display_name": info.get("display_name") or class_type,
+        "category": str(info.get("category", ""))[:80],
+        "inputs": _minimal_inputs(info.get("input", {})),
+        "output_slots": _build_output_slots(info),
+        "output_node": bool(info.get("output_node", False)),
+    }
+
+
+def _minimal_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    for group_name in ("required", "optional"):
+        group = inputs.get(group_name) if isinstance(inputs, dict) else {}
+        if not isinstance(group, dict):
+            continue
+        compact[group_name] = {}
+        for name, spec in group.items():
+            compact[group_name][name] = _minimal_input_spec(spec)
+    return compact
+
+
+def _minimal_input_spec(spec: Any) -> Any:
+    if isinstance(spec, (list, tuple)) and spec:
+        first = spec[0]
+        if isinstance(first, (list, tuple)):
+            if len(first) <= 8:
+                return {"type": "COMBO", "choices": list(first)}
+            return {"type": "COMBO", "sample": list(first[:5]), "choice_count": len(first)}
+        if isinstance(first, str):
+            return first
+        return str(first)
+    return _json_safe(spec)
+
+
+def compact_workflow_api(workflow_api: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(workflow_api, dict) or not workflow_api:
+        return {}
+    compact: dict[str, Any] = {}
+    for node_id, node in workflow_api.items():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs") or {}
+        compact_inputs: dict[str, Any] = {}
+        if isinstance(inputs, dict):
+            for key, value in inputs.items():
+                if isinstance(value, str) and len(value) > 160:
+                    compact_inputs[key] = value[:160] + "..."
+                else:
+                    compact_inputs[key] = value
+        compact[str(node_id)] = {
+            "class_type": node.get("class_type"),
+            "inputs": compact_inputs,
+        }
+    return compact
+
+
+def _slim_execution_errors(errors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    slim = []
+    for error in errors:
+        if not isinstance(error, dict):
+            continue
+        slim.append(
+            {
+                "node_id": error.get("node_id"),
+                "node_type": error.get("node_type"),
+                "exception_message": str(error.get("exception_message") or error.get("message") or "")[:500],
+                "exception_type": error.get("exception_type"),
+            }
+        )
+    return slim
+
+
+def _anthropic_tool_definition(tool: dict[str, Any]) -> dict[str, Any]:
+    function = tool.get("function") or {}
+    return {
+        "name": function.get("name"),
+        "description": function.get("description") or "",
+        "input_schema": function.get("parameters") or {"type": "object", "properties": {}},
+    }
+
+
+def _anthropic_text_from_content(content: list[dict[str, Any]]) -> str:
+    parts = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            parts.append(block.get("text") or "")
+    return "\n".join(parts).strip()
+
+
+def _slim_repair_context(repair_context: dict[str, Any]) -> dict[str, Any]:
+    candidate = repair_context.get("candidate") or {}
+    workflow = candidate.get("workflow") or candidate.get("workflow_api") or {}
+    return {
+        "candidate": {
+            "assistant_message": candidate.get("assistant_message"),
+            "workflow": compact_workflow_api(workflow),
+            "removed_node_ids": candidate.get("removed_node_ids") or [],
+            "model_downloads": (candidate.get("model_downloads") or [])[:8],
+        },
+        "validation": repair_context.get("validation"),
+    }
+
+
+def trim_context_for_llm(context: dict[str, Any], char_budget: int = COPILOT_CONTEXT_CHAR_BUDGET) -> dict[str, Any]:
+    trimmed = _json_safe(context)
+    payload = json.dumps(trimmed, ensure_ascii=False)
+    if len(payload) <= char_budget:
+        return trimmed
+
+    reduced = dict(trimmed)
+    for node_limit in (80, 60, 45, 30):
+        nodes_list = reduced.get("installed_nodes")
+        if isinstance(nodes_list, list) and len(nodes_list) > node_limit:
+            reduced["installed_nodes"] = nodes_list[:node_limit]
+        payload = json.dumps(reduced, ensure_ascii=False)
+        if len(payload) <= char_budget:
+            return reduced
+
+    for folder_limit in (8, 5, 3):
+        models = reduced.get("available_models")
+        if isinstance(models, dict):
+            reduced["available_models"] = {
+                folder: files[:folder_limit] for folder, files in models.items() if isinstance(files, list)
+            }
+        payload = json.dumps(reduced, ensure_ascii=False)
+        if len(payload) <= char_budget:
+            return reduced
+
+    ui = reduced.get("current_workflow_ui")
+    if isinstance(ui, dict):
+        reduced["current_workflow_ui"] = {
+            "node_count": ui.get("node_count"),
+            "nodes": (ui.get("nodes") or [])[:40],
+            "links": (ui.get("links") or [])[:60],
+        }
+    payload = json.dumps(reduced, ensure_ascii=False)
+    if len(payload) <= char_budget:
+        return reduced
+
+    workflow = reduced.get("current_workflow_api")
+    if isinstance(workflow, dict) and len(workflow) > 40:
+        keep_ids = list(workflow.keys())[:40]
+        reduced["current_workflow_api"] = {node_id: workflow[node_id] for node_id in keep_ids}
+    return reduced
+
+
+def summarize_ui_workflow(workflow_ui: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(workflow_ui, dict):
+        return {}
+    nodes_ui = workflow_ui.get("nodes")
+    links_ui = workflow_ui.get("links")
+    summary: dict[str, Any] = {"node_count": 0, "nodes": [], "links": []}
+    if isinstance(nodes_ui, list):
+        summary["node_count"] = len(nodes_ui)
+        summary["nodes"] = [
             {
                 "id": node.get("id"),
                 "type": node.get("type"),
                 "title": node.get("title"),
+                "widgets": _summarize_ui_widgets(node.get("widgets")),
             }
-            for node in nodes_ui[:200]
+            for node in nodes_ui[:80]
             if isinstance(node, dict)
-        ],
+        ]
+    if isinstance(links_ui, list):
+        summary["links"] = [
+            {
+                "origin_id": link[1] if isinstance(link, list) and len(link) > 1 else None,
+                "origin_slot": link[2] if isinstance(link, list) and len(link) > 2 else None,
+                "target_id": link[3] if isinstance(link, list) and len(link) > 3 else None,
+                "target_slot": link[4] if isinstance(link, list) and len(link) > 4 else None,
+            }
+            for link in links_ui[:120]
+            if isinstance(link, list)
+        ]
+    return summary
+
+
+def _summarize_ui_widgets(widgets: Any) -> list[dict[str, Any]]:
+    if not isinstance(widgets, list):
+        return []
+    compact = []
+    for widget in widgets[:30]:
+        if not isinstance(widget, dict):
+            continue
+        value = widget.get("value")
+        if isinstance(value, str) and len(value) > 120:
+            value = value[:120] + "..."
+        compact.append({"name": widget.get("name"), "type": widget.get("type"), "value": value})
+    return compact
+
+
+def merge_workflow_into_current(
+    current_workflow: dict[str, Any],
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    proposed = candidate.get("workflow") or candidate.get("workflow_api") or {}
+    if not isinstance(proposed, dict):
+        raise ValueError("LLM did not return a ComfyUI API-format workflow object.")
+    if not current_workflow:
+        return {str(node_id): node for node_id, node in proposed.items() if isinstance(node, dict)}
+
+    merged = {str(node_id): node for node_id, node in current_workflow.items() if isinstance(node, dict)}
+    for node_id in candidate.get("removed_node_ids") or []:
+        merged.pop(str(node_id), None)
+    for node_id, node in proposed.items():
+        if isinstance(node, dict):
+            merged[str(node_id)] = node
+    return merged
+
+
+def build_hardware_context() -> dict[str, Any]:
+    with suppress(Exception):
+        import comfy.model_management as mm
+
+        device = mm.get_torch_device()
+        device_name = mm.get_torch_device_name(device)
+        cpu_device = mm.torch.device("cpu")
+        ram_total = mm.get_total_memory(cpu_device)
+        ram_free = mm.get_free_memory(cpu_device)
+        vram_total, torch_vram_total = mm.get_total_memory(device, torch_total_too=True)
+        vram_free, torch_vram_free = mm.get_free_memory(device, torch_free_too=True)
+        vram_gb = round(vram_total / (1024**3), 2) if vram_total else 0
+        vram_free_gb = round(vram_free / (1024**3), 2) if vram_free else 0
+        recommendations = []
+        if mm.cpu_mode():
+            recommendations.append("CPU-only mode: use small resolutions, few steps, and lightweight models.")
+        elif vram_gb and vram_gb < 8:
+            recommendations.append("Low VRAM: prefer 512-768px, batch size 1, and model offloading nodes.")
+        elif vram_gb and vram_gb < 16:
+            recommendations.append("Mid VRAM: 1024px is usually fine; avoid huge batches or multiple large checkpoints.")
+        else:
+            recommendations.append("High VRAM: full-resolution workflows are feasible.")
+        return {
+            "device_name": device_name,
+            "device_type": getattr(device, "type", "unknown"),
+            "cpu_only": bool(mm.cpu_mode()),
+            "vram_total_gb": vram_gb,
+            "vram_free_gb": vram_free_gb,
+            "ram_total_gb": round(ram_total / (1024**3), 2) if ram_total else None,
+            "ram_free_gb": round(ram_free / (1024**3), 2) if ram_free else None,
+            "recommendations": recommendations,
+            "argv": [arg for arg in sys.argv if arg.startswith("--")][:12],
+        }
+    return {"cpu_only": "--cpu" in sys.argv, "recommendations": ["Hardware stats unavailable; assume conservative settings."]}
+
+
+def summarize_validation_for_llm(validation: dict[str, Any]) -> dict[str, Any]:
+    node_errors = validation.get("node_errors") or {}
+    flattened = []
+    for node_id, issues in node_errors.items():
+        if not isinstance(issues, dict):
+            continue
+        for issue in issues.get("errors", []):
+            if isinstance(issue, dict):
+                flattened.append(
+                    {
+                        "node_id": str(node_id),
+                        "type": issue.get("type"),
+                        "message": issue.get("message"),
+                        "details": issue.get("details"),
+                        "extra_info": issue.get("extra_info"),
+                    }
+                )
+    return {
+        "success": validation.get("success"),
+        "error": validation.get("error"),
+        "topology_warnings": validation.get("topology_warnings") or [],
+        "connection_issues": validation.get("connection_issues") or [],
+        "issues": flattened[:40],
+        "missing_models": validation.get("missing_models") or [],
     }
 
 
-def build_model_context() -> dict[str, list[str]]:
+def summarize_validation_for_client(validation: dict[str, Any]) -> dict[str, Any]:
+    return summarize_validation_for_llm(validation)
+
+
+def build_connection_hints_for_workflow(workflow_api: dict[str, Any]) -> list[dict[str, Any]]:
+    hints = []
+    for node_id, node in (workflow_api or {}).items():
+        if not isinstance(node, dict):
+            continue
+        class_type = node.get("class_type")
+        if class_type not in nodes.NODE_CLASS_MAPPINGS:
+            continue
+        try:
+            info = _node_info(class_type)
+        except Exception:
+            continue
+        hints.append(
+            {
+                "node_id": str(node_id),
+                "class_type": class_type,
+                "inputs": _minimal_inputs(info.get("input", {})),
+                "output_slots": _build_output_slots(info),
+            }
+        )
+    return hints[:80]
+
+
+def lint_workflow_connections(workflow_api: dict[str, Any]) -> list[str]:
+    if not isinstance(workflow_api, dict):
+        return ["workflow is not an object"]
+
+    issues: list[str] = []
+    for node_id, node in workflow_api.items():
+        if not isinstance(node, dict):
+            continue
+        class_type = node.get("class_type")
+        if class_type not in nodes.NODE_CLASS_MAPPINGS:
+            continue
+        obj_class = nodes.NODE_CLASS_MAPPINGS[class_type]
+        try:
+            input_specs = obj_class.INPUT_TYPES()
+        except Exception:
+            continue
+        required = input_specs.get("required", {}) if isinstance(input_specs, dict) else {}
+        optional = input_specs.get("optional", {}) if isinstance(input_specs, dict) else {}
+        inputs = node.get("inputs") or {}
+        if not isinstance(inputs, dict):
+            continue
+
+        for input_name, spec in {**required, **optional}.items():
+            if input_name not in required and input_name not in inputs:
+                continue
+            if input_name not in inputs:
+                if input_name in required:
+                    issues.append(f"node {node_id} ({class_type}) missing required input {input_name!r}")
+                continue
+            value = inputs[input_name]
+            if not _is_link(value):
+                continue
+            if not isinstance(value, list) or len(value) != 2:
+                issues.append(f"node {node_id} input {input_name!r} has invalid link {value!r}")
+                continue
+            source_id, slot_index = str(value[0]), value[1]
+            if source_id not in workflow_api:
+                issues.append(f"node {node_id} input {input_name!r} links to missing node {source_id}")
+                continue
+            source = workflow_api[source_id]
+            if not isinstance(source, dict):
+                continue
+            source_type = source.get("class_type")
+            if source_type not in nodes.NODE_CLASS_MAPPINGS:
+                issues.append(f"node {node_id} input {input_name!r} links to unknown class {source_type!r}")
+                continue
+            return_types = getattr(nodes.NODE_CLASS_MAPPINGS[source_type], "RETURN_TYPES", ())
+            if not isinstance(slot_index, int) or slot_index < 0 or slot_index >= len(return_types):
+                issues.append(
+                    f"node {node_id} input {input_name!r} uses invalid output slot {slot_index} on node {source_id}"
+                )
+                continue
+            received_type = return_types[slot_index]
+            expected_type = spec[0] if isinstance(spec, (list, tuple)) and spec else spec
+            from comfy_execution.validation import validate_node_input
+
+            if isinstance(expected_type, str) and isinstance(received_type, str):
+                if not validate_node_input(received_type, expected_type):
+                    issues.append(
+                        f"node {node_id} input {input_name!r} type mismatch: "
+                        f"expected {expected_type}, got {received_type} from node {source_id} slot {slot_index}"
+                    )
+    return issues
+
+
+def _merge_catalog_entries(primary: list[dict[str, Any]], extra: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen = {entry["class_type"] for entry in primary}
+    merged = list(primary)
+    for entry in extra:
+        if entry["class_type"] not in seen:
+            merged.append(entry)
+            seen.add(entry["class_type"])
+    return merged
+
+
+def _build_output_slots(info: dict[str, Any]) -> list[dict[str, Any]]:
+    outputs = info.get("output") or []
+    names = info.get("output_name") or outputs
+    slots = []
+    for index, output_type in enumerate(outputs):
+        label = names[index] if index < len(names) else f"output_{index}"
+        slots.append({"slot": index, "type": output_type, "name": label})
+    return slots
+
+
+def build_model_context(*, limit_per_folder: int = 10) -> dict[str, list[str]]:
     folders = [
         "checkpoints",
         "loras",
@@ -580,7 +1257,7 @@ def build_model_context() -> dict[str, list[str]]:
         except Exception:
             files = []
         if files:
-            context[folder] = files[:40]
+            context[folder] = files[:limit_per_folder]
     return context
 
 
@@ -794,32 +1471,165 @@ def _model_destination_path(folder: str, filename: str) -> str:
     return destination
 
 
-def build_node_catalog(query: str = "", limit: int | None = 200) -> list[dict[str, Any]]:
+def search_node_class_types(
+    *,
+    query: str = "",
+    pinned: set[str] | None = None,
+    limit: int = 15,
+) -> list[dict[str, Any]]:
+    """Lightweight node search — names/categories only, no INPUT_TYPES scan."""
     terms = [term.lower() for term in re.findall(r"[a-zA-Z0-9_./-]+", query or "") if len(term) > 2]
-    catalog = []
-    for class_type in sorted(nodes.NODE_CLASS_MAPPINGS):
-        try:
-            info = _node_info(class_type)
-        except Exception:
-            logging.exception("Failed to read node metadata for %s", class_type)
+    pinned = pinned or set()
+    scored: list[tuple[int, str]] = []
+
+    for class_type in nodes.NODE_CLASS_MAPPINGS:
+        display_name = nodes.NODE_DISPLAY_NAME_MAPPINGS.get(class_type, class_type)
+        category = str(getattr(nodes.NODE_CLASS_MAPPINGS[class_type], "CATEGORY", ""))[:80]
+        haystack = f"{class_type} {display_name} {category}".lower()
+        score = sum(1 for term in terms if term in haystack) if terms else 0
+        if class_type in pinned:
+            score += 1000
+        if terms and score == 0 and class_type not in pinned:
             continue
-        entry = {
+        scored.append((score, class_type))
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for _, class_type in scored:
+        if class_type in seen:
+            continue
+        seen.add(class_type)
+        ordered.append(class_type)
+        if len(ordered) >= limit:
+            break
+    for class_type in sorted(pinned):
+        if class_type in nodes.NODE_CLASS_MAPPINGS and class_type not in seen:
+            ordered.insert(0, class_type)
+            seen.add(class_type)
+        if len(ordered) >= limit:
+            break
+
+    results: list[dict[str, Any]] = []
+    for class_type in ordered[:limit]:
+        display_name = nodes.NODE_DISPLAY_NAME_MAPPINGS.get(class_type, class_type)
+        category = str(getattr(nodes.NODE_CLASS_MAPPINGS[class_type], "CATEGORY", ""))[:80]
+        results.append(
+            {
+                "class_type": class_type,
+                "display_name": display_name,
+                "category": category,
+            }
+        )
+    return results
+
+
+def get_node_info_entry(class_type: str, *, detailed: bool = False) -> dict[str, Any] | None:
+    """Return schema for one node without scanning the full catalog."""
+    class_type = (class_type or "").strip()
+    if not class_type or class_type not in nodes.NODE_CLASS_MAPPINGS:
+        return None
+    try:
+        info = _node_info(class_type)
+    except Exception:
+        logging.exception("Failed to read node metadata for %s", class_type)
+        return None
+    if detailed:
+        return {
             "class_type": class_type,
             "display_name": info.get("display_name") or class_type,
             "category": info.get("category", ""),
-            "description": str(info.get("description", ""))[:700],
+            "description": str(info.get("description", ""))[:400],
             "inputs": _compact_inputs(info.get("input", {})),
             "outputs": info.get("output", []),
             "output_names": info.get("output_name", []),
+            "output_slots": _build_output_slots(info),
             "output_node": bool(info.get("output_node", False)),
             "python_module": info.get("python_module", ""),
         }
-        score = _score_catalog_entry(entry, terms)
-        catalog.append((score, entry))
+    return _minimal_catalog_entry(class_type, info)
 
-    catalog.sort(key=lambda item: (-item[0], item[1]["class_type"]))
-    entries = [entry for _, entry in catalog]
-    return entries if limit is None else entries[:limit]
+
+def build_node_catalog(query: str = "", limit: int | None = 50, *, detailed: bool = False) -> list[dict[str, Any]]:
+    if limit is None:
+        limit = 50
+    limit = max(1, min(int(limit), 100))
+    hits = search_node_class_types(query=query, limit=limit)
+    catalog: list[dict[str, Any]] = []
+    for hit in hits:
+        entry = get_node_info_entry(hit["class_type"], detailed=detailed)
+        if entry:
+            catalog.append(entry)
+    return catalog
+
+
+def serialize_tool_result_for_llm(result: dict[str, Any]) -> str:
+    payload = json.dumps(_json_safe(result), ensure_ascii=False)
+    if len(payload) <= TOOL_RESULT_CHAR_LIMIT:
+        return payload
+    return payload[:TOOL_RESULT_CHAR_LIMIT]
+
+
+def estimate_messages_char_size(messages: list[dict[str, Any]]) -> int:
+    return len(json.dumps(messages, ensure_ascii=False, default=str))
+
+
+def trim_messages_for_llm_budget(
+    messages: list[dict[str, Any]],
+    char_budget: int = LLM_MESSAGE_CHAR_BUDGET,
+) -> list[dict[str, Any]]:
+    if not messages:
+        return messages
+    if estimate_messages_char_size(messages) <= char_budget:
+        return messages
+
+    system_messages = [message for message in messages if message.get("role") == "system"]
+    other_messages = [message for message in messages if message.get("role") != "system"]
+
+    def shrink_tool_content(message: dict[str, Any]) -> dict[str, Any]:
+        message = dict(message)
+        content = message.get("content")
+        if message.get("role") == "tool" and isinstance(content, str) and len(content) > 800:
+            message["content"] = content[:800] + "…"
+        elif message.get("role") == "user" and isinstance(content, list):
+            trimmed_blocks = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    block = dict(block)
+                    text = str(block.get("content") or "")
+                    if len(text) > 800:
+                        block["content"] = text[:800] + "…"
+                trimmed_blocks.append(block)
+            message["content"] = trimmed_blocks
+        elif isinstance(content, str) and len(content) > 4000:
+            message["content"] = content[:4000] + "…"
+        return message
+
+    other_messages = [shrink_tool_content(message) for message in other_messages]
+    while other_messages and estimate_messages_char_size(system_messages + other_messages) > char_budget:
+        if len(other_messages) <= 2:
+            other_messages = [shrink_tool_content(other_messages[-1])]
+            break
+        other_messages.pop(0)
+
+    trimmed = system_messages + other_messages
+    if estimate_messages_char_size(trimmed) > char_budget:
+        raise ValueError(
+            "Copilot context is too large for the selected model. "
+            "Clear chat history, simplify the graph, or use a model with a larger context window."
+        )
+    return trimmed
+
+
+def _log_llm_payload_size(messages: list[dict[str, Any]], *, round_index: int) -> None:
+    size = estimate_messages_char_size(messages)
+    logging.info(
+        "ComfyUI Copilot LLM payload round=%s messages=%s chars=%s est_tokens=%s",
+        round_index,
+        len(messages),
+        size,
+        size // 4,
+    )
 
 
 def _node_info(node_class: str) -> dict[str, Any]:
